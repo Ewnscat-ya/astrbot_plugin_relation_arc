@@ -34,6 +34,7 @@
 | `0cb85983`（v4.4.5 WebUI 深度重构） | WebUI 体验升级 | 无直接影响（前端为两套实现）；MIS-98/99 做 Pages 体验时可对照其交互模式 | 仅借鉴，不复制（AGPL/Apache 边界见下） | MIS-98/99 验收项 |
 | `e707f52a`、`4a38517a`、`41263d21`（prompt 模板重构：轻量规则、强制页脚、scoring mode、拒绝示例） | 提示词结构与服从性 | 间接受影响：本项目协议合同注入（`RelationArcOutputContract`）与上游 prompt 无共享文本；其"拒绝示例"思路与本项目反强推条款同向 | 保留本项目实现；MIS-94 统一模型/用户说明时可对照措辞，不自动采用 | MIS-91/94 协议回归 |
 | 上游 `init_db`（无 schema 版本校验，仅按列补齐） | 本项目 schema user_version 门禁 | 本项目受影响面不同：上游没有版本门禁可借鉴；MIS-89 独立实现"未来版本拒绝 + 损坏库拒绝 + 单事务迁移" | 独立修复（无上游对应物）；不在筛选表标记为"已实现"，标记为"本项目新增" | tests：`SchemaVersionGuardTests`（未来版本/损坏库/保留原文件）、迁移原子性 |
+| 上游 master "Web API 改 FastAPI/Starlette" 的潜在风险 | MIS-88 曾按此假设需封装兼容层 | **假设已修正**：实测 pip 4.26.0/4.28.0 发布版均为 Starlette 面板 + 内置 Quart 兼容桥，插件现有 Quart handler 是发布版支持的契约，无需兼容层 | 保留本项目实现；包级回归 `tests/test_host_compat.py` 两版本全绿；真实宿主端到端留 MIS-101 | HOST_COMPATIBILITY.md 核验矩阵 |
 | `4813daf9`、`2fa253d4` 等（v4.4.3 beta 合流） | 常规发布 | 无独立影响 | 跟随上表逐项评估 | — |
 
 ## 三、补充技术参考（4 个，非上游）

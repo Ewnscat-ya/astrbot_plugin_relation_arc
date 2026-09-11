@@ -27,32 +27,33 @@ Mimosa L3 提交门禁在基线代码上报告两处高危，均已修复并验�
 
 修复后重跑 `tools/behavior_contract_samples.py`，输出与 `BEHAVIOR_CONTRACT.md` 记录逐字节一致（diff 为空）——行为基线不受影响。上游 Favour Ultra `storage.py` 已在快照 `2f2ec141` 直接核验（locked 重试装饰器、WAL、备份/恢复/衰减机制），详见 REUSE_DECISIONS.md 来源映射。
 
-## 测试执行结果（99 个方法：核心 38 / 入口 52 / P0 9）
+## 测试执行结果（112 个方法：核心 38 / 入口 52 / P0 9 / 宿主兼容 13）
 
-MIS-87 时为 92 个方法；MIS-89 新增 7 个版本门禁与身份修复回归测试（复现先行：修复前 6 项失败，修复后全绿），现有 92 个方法零改动。
+92（MIS-87 基线）→ 99（MIS-89 新增 7 个版本门禁与身份修复回归，复现先行：修复前 6 项失败）→ 112（MIS-88 新增 13 个宿主兼容回归，走宿主真实 Quart 兼容桥；两版本全绿）。现有方法零改动、零删除。
 
 | 环境 | 命令 | 结果 |
 | -- | -- | -- |
-| 无宿主包（系统 Python） | `python -m unittest tests.test_core tests.test_p0` | 40/40 通过（1.8s）；test_main.py 因缺 `astrbot` 包导入失败 → 记为**缺依赖**，非用例失败 |
-| 虚拟环境 + astrbot 4.28.0 | `python -m unittest discover -s tests` | **92/92 通过**（4.6s） |
-| 虚拟环境 + astrbot 4.26.0（声明下限） | 同上 | **92/92 通过**（4.5s） |
-| 虚拟环境 + astrbot 4.27.0 | 同上 | **92/92 通过**（4.5s） |
+| 无宿主包（系统 Python） | `python -m unittest tests.test_core tests.test_p0` | 40/40 通过（1.8s）；test_main/test_host_compat 因缺 `astrbot` 包导入失败/跳过 → 记为**缺依赖**，非用例失败 |
+| 虚拟环境 + astrbot 4.28.0 | `python -m unittest discover -s tests` | **112/112 通过**（4.9s） |
+| 虚拟环境 + astrbot 4.26.0（声明下限） | 同上 | **112/112 通过**（4.9s） |
+| 虚拟环境 + astrbot 4.27.0 | 同上（MIS-87 时 92 方法） | **92/92 通过**（4.5s） |
 | 虚拟环境 + astrbot 4.28.0（MIS-89 后，99 方法） | 同上 | **99/99 通过**（4.6s） |
 
 - 既有失败：0。新回归：0。缺依赖：已通过安装 pip 发布包消除（仅宿主程序运行仍缺）。
 - 入口测试（test_main.py）使用宿主真实数据类（`ProviderRequest`/`Plain`/`MessageChain`）与 Fake 事件对象，属于"包级 API 兼容"证据；不等于真实 HTTP/适配器链路验收。
+- 宿主兼容测试（test_host_compat.py）走宿主真实 Quart 兼容桥与路由匹配函数，包级证明 8 个 Pages API 与 400/403/404/409 行为；真实宿主/浏览器层仍未覆盖（见 HOST_COMPATIBILITY.md）。
 
 ## 从新环境重建测试
 
-1. 取得仓库并检出 `dba500b`（或当前基线 commit）。
+1. 取得仓库并检出基线 commit。
 2. 创建独立虚拟环境：`python -m venv .venv`（仓库外），激活后 `pip install astrbot`（当前 4.28.0；验证下限用 `pip install astrbot==4.26.0`）。
-3. 在仓库目录运行：`python -m unittest discover -s tests -v` → 应为 `Ran 92 tests ... OK`。
+3. 在仓库目录运行：`python -m unittest discover -s tests -v` → 应为 `Ran 112 tests ... OK`。
 4. 生成行为合同样例：`python tools/behavior_contract_samples.py` → 输出应与 `docs/BEHAVIOR_CONTRACT.md` 记录一致（数字确定性，不含时间戳）。
-5. 无 astrbot 包时仅能运行 `python -m unittest tests.test_core tests.test_p0`（40 个），此时不要把入口测试标记为失败。
+5. 无 astrbot 包时仅能运行 `python -m unittest tests.test_core tests.test_p0`（40 个），此时不要把其余测试标记为失败。
 
 ## 最小真实宿主与 Pages 验证入口（供 MIS-88 / MIS-101 执行）
 
-- **入口测试层**（已可执行）：`tests/test_main.py` 覆盖 inject/judge/管理命令的行为，使用宿主数据类 + Fake 事件；判定标准 = 92/92 OK。
+- **包级兼容层**（已可执行）：`tests/test_host_compat.py`，判定标准 = 两版本 112/112 OK；结论见 `docs/HOST_COMPATIBILITY.md`。
 - **真实宿主层**（未覆盖）：需要一个运行中的 AstrBot 实例。验证步骤：安装插件 → 启用 → 分别在私聊、群聊（@/回复/普通消息三类）发送消息 → 核对 `on_llm_request` 注入两段合同文本、`on_llm_response` 结算、`/关系` `/关系记录` 输出、协议块不出现在最终回复。判定标准 = 以上行为与 BEHAVIOR_CONTRACT.md 一致。
 - **Pages 层**（未覆盖）：宿主 Web 面板中打开插件 settings 页；验证配置读写、关系列表/审计/绑定接口的 HTTP 状态与鉴权；MIS-98/MIS-99 补分页与保存语义。
 

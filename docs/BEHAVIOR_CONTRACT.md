@@ -5,7 +5,7 @@
 后续任务若需改变以下任何行为，必须满足行为合同的独立决策流程（前后案例 + 迁移回滚说明），并同步更新本文件与脚本。
 
 - 生成环境：Python 3.12.10 + AstrBot 4.28.0（pip 包，仅作依赖与数据类来源）+ SQLite 3.49.1
-- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（99 个方法，见 BASELINE_VALIDATION.md）
+- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（112 个方法，见 BASELINE_VALIDATION.md）
 - 复跑方式：见 `docs/BASELINE_VALIDATION.md` 的"从新环境重建"
 
 ## 样例输出（脚本实际运行结果）
