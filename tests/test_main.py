@@ -136,7 +136,12 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["interaction_safety"]["llm_mode"]="administrator_only"
         await self.plugin.judge(event, FakeResponse(payload))
         kind,sid=self.plugin._scope(event); identity=self.plugin._identity(event)
-        self.assertEqual("normal",self.plugin.store.existing_account(identity,kind,sid)["state"]["interaction_safety"])
+        # MIS-92: a rejected-proposal turn is a zero-write noop — the account
+        # row may not exist yet, and in either case nothing escalates.
+        row=self.plugin.store.existing_account(identity,kind,sid)
+        if row is not None:
+            self.assertEqual("normal",row["state"]["interaction_safety"])
+        self.assertIsNone(self.plugin.store.active_timed_safety(identity,kind,sid))
         self.plugin.config["interaction_safety"]["llm_mode"]="llm_auto"
         event.message_obj=type("Message",(),{"message_id":"c0-escalate"})()
         response=FakeResponse(payload)
@@ -771,6 +776,34 @@ class RichChainStripTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.judge(event, response)
         self.assertEqual([Plain("可见回复。")], chain.chain)
         self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+
+class SettlementHealthTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-92: replays are recorded as duplicate, never as applied success."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_replay_records_duplicate_not_applied(self):
+        block = ('<relation_judgment>{"schema_version":1,"fact_effects":[{"effects":{"trust":4}}]}'
+                 "</relation_judgment>回复")
+        event = FakeEvent()
+        await self.plugin.judge(event, FakeResponse(block))
+        await self.plugin.judge(event, FakeResponse(block))
+        summary = self.plugin.store.protocol_health_summary()
+        buckets = {}
+        for bucket in summary["buckets"]:
+            buckets[bucket["outcome"]] = buckets.get(bucket["outcome"], 0) + bucket["count"]
+        self.assertEqual(1, buckets.get("applied", 0))
+        self.assertEqual(1, buckets.get("duplicate_event", 0))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+        self.assertEqual(1, self.plugin.store.settlement_event_count("qq-adapter:user-1", "global", ""))
 
 
 if __name__ == "__main__":

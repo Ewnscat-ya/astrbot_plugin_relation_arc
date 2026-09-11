@@ -421,85 +421,56 @@ class RelationArc(Star):
         if self.config.get("auto_blacklist",{}).get("enabled") and self.store.is_settlement_blacklisted(identity,scope_kind,scope_id):
             logger.info("[关系弧线] settlement=blacklist_skipped")
             return
-        account = self.store.account(identity, scope_kind, scope_id)
-        values, state = account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"])
-        timed_safety=None
-        safety_proposal=parsed.safety_proposal
-        safety_mode=self.config.get("interaction_safety",{}).get("llm_mode","administrator_only")
-        if safety_proposal and safety_mode == "llm_auto":
-            rank={"normal":0,"slow_down":1,"pause_intimacy":2}
-            base_safety=account["state"].get("interaction_safety","normal")
-            current_safety=state.get("interaction_safety","normal")
-            proposed=safety_proposal["level"]
-            # Refresh an existing automatic level; never create a redundant
-            # automatic record over equal/stronger manual base protection.
-            existing=self.store.active_timed_safety(identity,scope_kind,scope_id)
-            if rank[proposed] > rank[current_safety] or (existing and rank[proposed] == rank[current_safety] and rank[proposed] > rank[base_safety]):
-                timed_safety={"level":proposed,"duration_minutes":int(self.config.get("interaction_safety",{}).get("auto_duration_minutes",30))}
-        final_state = {**state, **({"interaction_safety": timed_safety["level"]} if timed_safety else {})}
-        romance_allowed = self._romance_settlement_allowed(values, final_state)
+        # MIS-92: everything below (state read -> policy/window/eligibility ->
+        # writes) runs inside one store transaction with in-transaction
+        # recomputation; policy stays here as pure callbacks.
+        safety_proposal = parsed.safety_proposal
         all_effects = [item["effects"] for item in parsed.effects]
-        applied, notes = {}, {}
         requested_all = {dimension: aggregate_effects(all_effects, dimension, self.config["raw_delta_limit"]) for dimension in DIMENSIONS}
         fact_signature = self.store.effect_signature(requested_all)
-        for dimension in DIMENSIONS:
-            requested = requested_all[dimension]
-            if not requested:
-                continue
-            if dimension == "romance_interest" and not romance_allowed:
-                # Locked romance never moves in either direction; anti-coercion is a hard backend gate.
-                notes[dimension] = {"requested": requested, "repeat_factor": 1.0, "notes": ("romance_locked",), "window_positive": 0}
-                applied[dimension] = 0
-                continue
-            blocked = False
-            repeat_count = self.store.repeat_count(
-                identity, scope_kind, scope_id, dimension, parsed.effects[0]["evidence"],
-                time.time() - self.config["repeat_window_minutes"] * 60,
-                signature=fact_signature,
-            )
-            result = apply_delta(values.get(dimension, 0), requested, repeat_count, self.config["repeat_factors"], blocked)
-            anti_farm = self.config.get("anti_farm", {})
-            ceiling = int(anti_farm.get("positive_change_ceiling", {}).get(dimension, 0))
-            since = time.time() - int(anti_farm.get("rolling_window_hours", 24)) * 3600
-            already_positive = self.store.positive_window_total(identity, scope_kind, scope_id, dimension, since)
-            applied_value = result.applied
-            if applied_value > 0 and ceiling > 0:
-                applied_value = max(0, min(applied_value, ceiling - already_positive))
-                if applied_value != result.applied:
-                    result_notes = tuple((*result.notes, "rolling_window_cap"))
-                else:
-                    result_notes = result.notes
-            else:
-                result_notes = result.notes
-            applied[dimension] = applied_value
-            notes[dimension] = {"requested": requested, "repeat_factor": result.repeat_factor, "notes": result_notes, "window_positive": already_positive}
         import hashlib
         # events.event_id is a database-wide primary key, so a bare adapter
         # message ID is insufficient: distinct platforms/sessions may reuse it.
         event_key="\x1f".join((identity,scope_kind,scope_id,str(raw_message_id)))
         event_id="llm:"+hashlib.sha256(event_key.encode("utf-8")).hexdigest()
-        projected={key:max(0,min(1000,values.get(key,0)+applied.get(key,0))) for key in DIMENSIONS}
-        binding, binding_reason=self._binding_candidate(parsed.proposal, projected, final_state, scope_kind, scope_id, identity, event_id)
-        # A valid binding can occur on a no-score turn; a score-only no-op remains no write.
-        if not any(applied.values()) and not binding and not timed_safety:
-            self._record_health("zero_after_policy", text_source, parsed)
-            logger.info("[关系弧线] settlement=zero_after_policy binding=%s", binding_reason)
-            return
-        if parsed.proposal and not binding: notes["binding"]={"notes":(f"binding_rejected:{binding_reason}",)}
-        if safety_proposal:
-            if timed_safety: notes["interaction_safety"]={"notes":("timed_safety_applied:"+timed_safety["level"],)}
-            else: notes["interaction_safety"]={"notes":("safety_suggestion_not_applied:"+safety_mode,)}
-        _, binding_status=self.store.apply_turn_with_binding(
+
+        def romance_gate(current_values, current_state):
+            return self._romance_settlement_allowed(current_values, current_state)
+
+        def binding_gate(projected, final_state):
+            return self._binding_candidate(parsed.proposal, projected, final_state, scope_kind, scope_id, identity, event_id)
+
+        values, status, info = self.store.settle_turn(
             event_id=event_id, identity=identity, scope_kind=scope_kind, scope_id=scope_id,
             source_kind=pinned_source or ("group" if self._is_group(event) else "private"),
-            evidence=" | ".join(item["evidence"] for item in parsed.effects), reason=" | ".join(item["reason"] for item in parsed.effects),
-            requested=requested_all, applied=applied, notes=notes, binding=binding, timed_safety=timed_safety)
+            evidence=" | ".join(item["evidence"] for item in parsed.effects),
+            reason=" | ".join(item["reason"] for item in parsed.effects),
+            requested_all=requested_all, fact_signature=fact_signature,
+            safety_proposal=safety_proposal,
+            policy={
+                "repeat_window_minutes": self.config["repeat_window_minutes"],
+                "repeat_factors": self.config["repeat_factors"],
+                "anti_farm": self.config.get("anti_farm", {}),
+                "safety_mode": self.config.get("interaction_safety", {}).get("llm_mode", "administrator_only"),
+                "auto_duration_minutes": int(self.config.get("interaction_safety", {}).get("auto_duration_minutes", 30)),
+            },
+            romance_gate=romance_gate, binding_gate=binding_gate)
+        if status == "duplicate":
+            # A replay must never fake success in health or blacklist counts.
+            self._record_health("duplicate_event", text_source, parsed)
+            logger.info("[关系弧线] settlement=duplicate_event")
+            return
+        if status == "noop":
+            self._record_health("zero_after_policy", text_source, parsed)
+            logger.info("[关系弧线] settlement=zero_after_policy binding=%s", info.get("binding_reason"))
+            return
+        binding_status = info.get("status", "no_binding")
         self._record_health("applied", text_source, parsed)
         blacklist=self.config.get("auto_blacklist",{})
         if blacklist.get("enabled") and self.store.settlement_event_count(identity,scope_kind,scope_id) >= int(blacklist["settlement_limit"]):
             self.store.blacklist_settlement(identity,scope_kind,scope_id,"settlement_limit")
             logger.info("[关系弧线] settlement=blacklist_added")
-        logger.info("[关系弧线] settlement=applied dimensions=%s binding=%s", ",".join(sorted(key for key,value in applied.items() if value)), binding_status)
+        logger.info("[关系弧线] settlement=applied dimensions=%s binding=%s", ",".join(sorted(key for key,value in info.get("applied", {}).items() if value)), binding_status)
 
     @filter.command("关系", alias={"关系状态"})
     async def relation(self, event: AstrMessageEvent):

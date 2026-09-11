@@ -5,7 +5,7 @@
 后续任务若需改变以下任何行为，必须满足行为合同的独立决策流程（前后案例 + 迁移回滚说明），并同步更新本文件与脚本。
 
 - 生成环境：Python 3.12.10 + AstrBot 4.28.0（pip 包，仅作依赖与数据类来源）+ SQLite 3.49.1
-- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（137 个方法，见 BASELINE_VALIDATION.md）
+- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（144 个方法，见 BASELINE_VALIDATION.md）
 - 复跑方式：见 `docs/BASELINE_VALIDATION.md` 的"从新环境重建"
 
 ## 样例输出（脚本实际运行结果）
@@ -118,6 +118,8 @@
 | 群聊 `group_require_at_or_reply` 翻转 | 以响应期配置为准 | 以**请求期定向结论**为准 |
 
 - 正常路径（无中途翻转）的计分、冷却、绑定、安全语义与上文合同完全一致；此附录只定义"配置翻转竞态"这一此前未定义的行为。
+- **结算状态机（MIS-92）**：每轮结算在单个 SQLite 写事务内完成"读状态→策略/窗口/资格重算→写入"，返回 committed / duplicate / noop。noop 轮（零变化且无绑定/安全动作）零写入——不创建账户行；duplicate 轮（同 message_id 重放）零写入且健康记 `duplicate_event`（绝不假报 applied、不进黑名单计数）。
+- **排他数据库保证（MIS-92）**：schema v10 增加 `status='active' AND unique_scope<>''` 的部分唯一索引；建索引前先审计历史冲突，有冲突仅记脱敏计数、不删数据，之后每次启动无冲突时自动重试。
 - 定向识别改为真实 At/Reply 组件：伪造 `[At:...]` 文本、回复他人不再触发；无结构化组件的适配器保留 outline best-effort 回退并保留 wake 语义。
 ## 附录二：协议清理契约（MIS-91 起生效）
 

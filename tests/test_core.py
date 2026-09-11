@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sqlite3
 import sys
 import tempfile
@@ -10,7 +11,7 @@ sys.path.insert(0, str(ROOT.parent))
 
 from astrbot_plugin_relation_arc.relation_engine import DEFAULT_VALUES, aggregate_effects, apply_delta, behavior_projection
 from astrbot_plugin_relation_arc.relation_protocol import parse_response
-from astrbot_plugin_relation_arc.relation_store import RelationStore
+from astrbot_plugin_relation_arc.relation_store import SCHEMA_VERSION, RelationStore
 from astrbot_plugin_relation_arc.config_manager import PluginConfigManager
 from astrbot_plugin_relation_arc.relationship_types import get_type, public_directory, projected_eligibility
 
@@ -165,7 +166,7 @@ class RelationArcCoreTests(unittest.TestCase):
             store = RelationStore(root)
             verify = sqlite3.connect(db)
             try:
-                self.assertEqual(9, verify.execute("PRAGMA user_version").fetchone()[0])
+                self.assertEqual(SCHEMA_VERSION, verify.execute("PRAGMA user_version").fetchone()[0])
                 self.assertIn("relationship_bindings", {row[0] for row in verify.execute("SELECT name FROM sqlite_master WHERE type='table'")})
                 self.assertEqual(0, verify.execute("SELECT count(*) FROM relationship_bindings").fetchone()[0])
             finally: verify.close()
@@ -214,13 +215,13 @@ class RelationArcCoreTests(unittest.TestCase):
             store = RelationStore(root)
             verify_conn = sqlite3.connect(db)
             try:
-                self.assertEqual(9, verify_conn.execute("PRAGMA user_version").fetchone()[0])
+                self.assertEqual(SCHEMA_VERSION, verify_conn.execute("PRAGMA user_version").fetchone()[0])
             finally:
                 verify_conn.close()
             self.assertEqual(444, store.account("qq:legacy")["values"]["trust"])
             self.assertEqual("legacy-event", store.list_events()[0]["event_id"])
             migrations = store.list_migrations()
-            self.assertTrue(any(item["from_version"] == 0 and item["to_version"] == 9 for item in migrations))
+            self.assertTrue(any(item["from_version"] == 0 and item["to_version"] == SCHEMA_VERSION for item in migrations))
             backups = store.list_backups()
             self.assertTrue(any(item["kind"] == "migration" for item in backups))
             self.assertFalse(store.cleanup_auto_backups(1))
@@ -336,7 +337,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
             store.account("qq:keep", "global", "")
             db_path = Path(directory) / "relation_arc.sqlite3"
             raw = sqlite3.connect(db_path)
-            raw.execute("PRAGMA user_version=10")
+            raw.execute("PRAGMA user_version=11")
             raw.commit()
             raw.close()
             with self.assertRaises(ValueError) as ctx:
@@ -346,7 +347,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
             version = check.execute("PRAGMA user_version").fetchone()[0]
             kept = check.execute("SELECT identity FROM accounts WHERE identity='qq:keep'").fetchone()
             check.close()
-            self.assertEqual(10, version)
+            self.assertEqual(11, version)
             self.assertIsNotNone(kept)
 
     def test_corrupt_database_refused_and_preserved(self):
@@ -496,6 +497,148 @@ class ProtocolHardeningTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertIn('"schema_version": 9', result.clean_text)
         self.assertEqual([], result.effects)
+
+
+class SettlementAtomicityTests(unittest.TestCase):
+    """MIS-92: one transaction per settlement; database-level exclusivity."""
+
+    def _policy(self, trust_ceiling=5):
+        return {
+            "repeat_window_minutes": 180,
+            "repeat_factors": [1.0],
+            "anti_farm": {"rolling_window_hours": 24,
+                          "positive_change_ceiling": {"trust": trust_ceiling, "respect": 50,
+                                                      "comfort": 40, "closeness": 30,
+                                                      "resonance": 30, "romance_interest": 15}},
+            "safety_mode": "administrator_only",
+            "auto_duration_minutes": 30,
+        }
+
+    @staticmethod
+    def _no_binding(projected, state):
+        return (None, "no_proposal")
+
+    @staticmethod
+    def _romance_open(values, state):
+        return True
+
+    def test_concurrent_settlements_respect_window_ceiling(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            store.account("qq:race", "global", "")
+            policy = self._policy(trust_ceiling=5)
+            barrier = threading.Barrier(2)
+            outcomes = []
+
+            def worker(index):
+                barrier.wait()
+                outcomes.append(store.settle_turn(
+                    event_id=f"race-{index}", identity="qq:race", scope_kind="global", scope_id="",
+                    source_kind="private", evidence="same fact", reason="r",
+                    requested_all={"trust": 4}, fact_signature='{"trust": 4}',
+                    safety_proposal=None, policy=policy,
+                    romance_gate=self._romance_open, binding_gate=self._no_binding))
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            self.assertEqual({"committed", "committed"}, {status for _, status, _ in outcomes})
+            final = store.existing_account("qq:race", "global", "")["values"]["trust"]
+            self.assertLessEqual(final, 405)
+            self.assertEqual(final, 400 + sum(sum(info["applied"].values()) for _, _, info in outcomes))
+
+    def test_duplicate_replay_leaves_no_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._policy()
+            kwargs = dict(identity="qq:dup", scope_kind="global", scope_id="", source_kind="private",
+                          evidence="e", reason="r", requested_all={"trust": 4},
+                          fact_signature='{"trust": 4}', safety_proposal=None, policy=policy,
+                          romance_gate=self._romance_open, binding_gate=self._no_binding)
+            values, status, info = store.settle_turn(event_id="same-1", **kwargs)
+            self.assertEqual("committed", status)
+            before_revision = store.existing_account("qq:dup", "global", "")["revision"]
+            before_events = len(store.recent("qq:dup", "global", "", 50))
+            values, status, info = store.settle_turn(event_id="same-1", **kwargs)
+            self.assertEqual("duplicate", status)
+            self.assertEqual({}, values)
+            self.assertEqual(before_revision, store.existing_account("qq:dup", "global", "")["revision"])
+            self.assertEqual(before_events, len(store.recent("qq:dup", "global", "", 50)))
+            self.assertEqual(1, store.settlement_event_count("qq:dup", "global", ""))
+
+    def test_concurrent_exclusive_bindings_have_single_winner(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._policy()
+            barrier = threading.Barrier(2)
+
+            def worker(user, binding_id):
+                gate = lambda projected, state: (
+                    {"binding_id": binding_id, "type_key": "romantic_partner",
+                     "unique_scope": "romance", "origin": "test", "summary": ""},
+                    "eligible")
+                barrier.wait()
+                return store.settle_turn(
+                    event_id=f"bind-{binding_id}", identity=f"qq:{user}", scope_kind="global",
+                    scope_id="", source_kind="private", evidence="mutual", reason="mutual",
+                    requested_all={"trust": 2}, fact_signature='{"trust": 2}',
+                    safety_proposal=None, policy=policy,
+                    romance_gate=self._romance_open, binding_gate=gate)
+
+            threads = [threading.Thread(target=worker, args=("a", "ba")),
+                       threading.Thread(target=worker, args=("b", "bb"))]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            active = store.list_bindings(status="active")
+            self.assertEqual(1, len(active))
+            self.assertEqual("romantic_partner", active[0]["type_key"])
+
+    def test_unique_index_rejects_conflicting_active_row(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            binding_a = ("ida", "global", "", "romantic_partner", "romance")
+            store.apply_turn_with_binding(
+                event_id="e1", identity="qq:a", scope_kind="global", scope_id="",
+                source_kind="private", evidence="", reason="", requested={}, applied={},
+                notes={}, binding={"binding_id": "ida", "type_key": "romantic_partner",
+                                   "unique_scope": "romance", "origin": "t", "summary": ""})
+            raw = sqlite3.connect(Path(directory) / "relation_arc.sqlite3")
+            with self.assertRaises(sqlite3.IntegrityError):
+                raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at) VALUES('idb','qq:b','global','','romantic_partner','active','romance','','{}',1,1,NULL)")
+            raw.close()
+
+    def test_admin_set_and_adjust_audits_actual_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            store.account("qq:admin", "global", "")
+            store.set_dimension("qq:admin", "global", "", "trust", 550)
+            store.adjust_dimension("qq:admin", "global", "", "trust", -20)
+            final = store.existing_account("qq:admin", "global", "")["values"]["trust"]
+            self.assertEqual(530, final)
+            deltas = sum(int(json.loads(row["applied_json"]).get("trust", 0))
+                         for row in store.recent("qq:admin", "global", "", 50))
+            self.assertEqual(final - 400, deltas)
+
+    def test_failure_injection_rolls_back_whole_settlement(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._policy()
+            with mock.patch.object(store, "_positive_window_total",
+                                   side_effect=[0, RuntimeError("injected failure")]):
+                with self.assertRaises(RuntimeError):
+                    store.settle_turn(
+                        event_id="boom", identity="qq:x", scope_kind="global", scope_id="",
+                        source_kind="private", evidence="e", reason="r",
+                        requested_all={"trust": 4, "comfort": 4},
+                        fact_signature='{"comfort": 4, "trust": 4}',
+                        safety_proposal=None, policy=policy,
+                        romance_gate=self._romance_open, binding_gate=self._no_binding)
+            self.assertIsNone(store.existing_account("qq:x", "global", ""))
+            self.assertEqual([], store.recent("qq:x", "global", "", 10))
 
 
 if __name__ == '__main__':
