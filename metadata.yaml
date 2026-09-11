@@ -1,0 +1,9 @@
+name: astrbot_plugin_relation_arc
+display_name: 多维关系弧线
+version: 0.1.0
+description: 独立的多维关系、风格投影与可审计关系账本插件
+author: Ewnscat
+astrbot_version: ">=4.26"
+pages:
+  - name: settings
+    title: 关系弧线
