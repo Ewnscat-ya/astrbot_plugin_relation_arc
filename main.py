@@ -11,7 +11,7 @@ from astrbot.api.star import Star, Context, register
 from astrbot.api.event import filter
 from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.core.agent.message import TextPart
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import At, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 from .config_manager import PluginConfigManager
@@ -98,8 +98,56 @@ class RelationArc(Star):
             return True
         if not self.config.get("group_require_at_or_reply", True):
             return True
+        if event.is_wake_up():
+            return True
+        # Structured components decide when the adapter provides them: real At
+        # / Reply-to-bot evidence only. Ordinary text that merely contains
+        # outline markers like "[At:...]" or a quoted-message prefix must never
+        # direct a settlement.
+        components = getattr(getattr(event, "message_obj", None), "message", None)
+        if isinstance(components, list) and components:
+            self_id = str(event.get_self_id())
+            for component in components:
+                if isinstance(component, At) and str(component.qq) == self_id:
+                    return True
+                if isinstance(component, Reply):
+                    sender_id = component.sender_id
+                    if sender_id is not None and str(sender_id) == self_id:
+                        return True
+                    for part in component.chain or []:
+                        if isinstance(part, At) and str(part.qq) == self_id:
+                            return True
+            return False
+        # Adapter without structured components: outline markers stay best-effort.
         text = event.get_message_outline()
-        return bool(event.is_wake_up() or "[引用消息(" in text or f"[At:{event.get_self_id()}]" in text)
+        return bool("[引用消息(" in text or f"[At:{event.get_self_id()}]" in text)
+
+    def _pin_turn_context(self, event: AstrMessageEvent) -> None:
+        """Pin this turn's identity, scope and gate decisions on the event.
+
+        The same host event object flows through on_llm_request and
+        on_llm_response. A Pages save between the two hooks must not move
+        where (or whether) the turn settles: the reply completes in the
+        context the user actually interacted with.
+        """
+        scope_kind, scope_id = self._scope(event)
+        try:
+            event._relation_arc_turn_ctx = {
+                "identity": self._identity(event),
+                "scope_kind": scope_kind,
+                "scope_id": scope_id,
+                "source_kind": "group" if self._is_group(event) else "private",
+                "message_id": getattr(getattr(event, "message_obj", None), "message_id", None),
+                "directed": self._group_is_directed(event),
+                "settled": self._enabled(event) and self.config.get("llm_judgment_enabled", True),
+            }
+        except Exception:
+            # Pinning is an in-memory nicety; never break the host LLM request.
+            pass
+
+    def _turn_context(self, event: AstrMessageEvent) -> dict | None:
+        ctx = getattr(event, "_relation_arc_turn_ctx", None)
+        return ctx if isinstance(ctx, dict) else None
 
     def _scope(self, event: AstrMessageEvent) -> tuple[str, str]:
         if self.config["is_global_relation"]:
@@ -205,6 +253,9 @@ class RelationArc(Star):
         scope_kind, scope_id = self._scope(event); identity=self._identity(event)
         # Normalize an expiry before feature gates; C1 cleanup cannot depend on LLM.
         self.store.active_timed_safety(identity,scope_kind,scope_id)
+        # Pin the turn before any gate so the response settles in the request's
+        # own context even if Pages config changes mid-turn.
+        self._pin_turn_context(event)
         if not self._enabled(event) or not self.config.get("llm_judgment_enabled", True): return
         account = self.store.account(identity, scope_kind, scope_id)
         values, state = account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"])
@@ -286,7 +337,14 @@ class RelationArc(Star):
     async def judge(self, event: AstrMessageEvent, response: LLMResponse) -> None:
         # Sanitization is unconditional; feature gates prohibit settlement, not cleanup.
         parsed, has_protocol, text_source, has_text = self._read_and_strip_judgment(response, event.message_str)
-        if not self._enabled(event) or not self.config.get("llm_judgment_enabled", True):
+        ctx = self._turn_context(event)
+        if ctx is not None:
+            settled = bool(ctx.get("settled"))
+            directed = bool(ctx.get("directed"))
+        else:
+            settled = self._enabled(event) and self.config.get("llm_judgment_enabled", True)
+            directed = self._group_is_directed(event)
+        if not settled:
             return
         # Match Favour's behavior: only a non-empty final model output without
         # its required control protocol is actionable.  Never log message text,
@@ -297,7 +355,7 @@ class RelationArc(Star):
                 logger.warning("[关系弧线] settlement=missing_protocol source=%s", text_source)
             return
         # Always remove a valid control block. A non-directed group message may not settle relation data.
-        if not self._group_is_directed(event):
+        if not directed:
             self._record_health("skipped_group_not_directed", text_source, parsed)
             logger.debug("[关系弧线] settlement=skipped_group_not_directed")
             return
@@ -317,9 +375,16 @@ class RelationArc(Star):
                 self._record_health("invalid_effects", text_source, parsed)
                 logger.info("[关系弧线] settlement=no_valid_fact")
             return
-        scope_kind, scope_id = self._scope(event)
-        identity = self._identity(event)
-        raw_message_id=getattr(getattr(event, "message_obj", None), "message_id", None)
+        if ctx is not None:
+            identity = ctx["identity"]
+            scope_kind, scope_id = ctx["scope_kind"], ctx["scope_id"]
+            raw_message_id = ctx.get("message_id")
+            pinned_source = ctx.get("source_kind")
+        else:
+            scope_kind, scope_id = self._scope(event)
+            identity = self._identity(event)
+            raw_message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+            pinned_source = None
         if raw_message_id is None or not str(raw_message_id).strip() or str(raw_message_id).lower() == "unknown":
             # Check before account(): that method creates first-interaction rows.
             self._record_health("skipped_no_stable_message_id", text_source, parsed)
@@ -400,7 +465,7 @@ class RelationArc(Star):
             else: notes["interaction_safety"]={"notes":("safety_suggestion_not_applied:"+safety_mode,)}
         _, binding_status=self.store.apply_turn_with_binding(
             event_id=event_id, identity=identity, scope_kind=scope_kind, scope_id=scope_id,
-            source_kind="group" if self._is_group(event) else "private",
+            source_kind=pinned_source or ("group" if self._is_group(event) else "private"),
             evidence=" | ".join(item["evidence"] for item in parsed.effects), reason=" | ".join(item["reason"] for item in parsed.effects),
             requested=requested_all, applied=applied, notes=notes, binding=binding, timed_safety=timed_safety)
         self._record_health("applied", text_source, parsed)

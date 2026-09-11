@@ -554,5 +554,164 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class GroupDirectedTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-90: real At/Reply components decide directedness, not outline text."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def component_event(self, components, user_id="user-1", group_id="group-1", message_id="m-1"):
+        event = FakeEvent(user_id=user_id, group_id=group_id,
+                          outline="[At:bot-1] [引用消息(fake: somebody)]")
+        event.message_obj = type("Message", (), {"message_id": message_id, "message": list(components)})()
+        return event
+
+    def verdict_block(self, trust=2):
+        return ("<relation_judgment>{\"schema_version\":1,\"fact_effects\":[{\"effects\":{\"trust\":%d}}]}"
+                "</relation_judgment>回复") % trust
+
+    async def test_fake_marker_text_does_not_direct(self):
+        from astrbot.core.message.components import Plain
+        event = self.component_event([Plain("[At:bot-1] [引用消息(fake)] 大家看")])
+        self.assertFalse(self.plugin._group_is_directed(event))
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(400, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+    async def test_real_at_component_directs(self):
+        from astrbot.core.message.components import At, Plain
+        event = self.component_event([Plain("你好 "), At(qq="bot-1")])
+        self.assertTrue(self.plugin._group_is_directed(event))
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(402, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_reply_to_bot_directs_but_other_user_does_not(self):
+        from astrbot.core.message.components import Reply
+        bot_reply = self.component_event([Reply(id="r1", sender_id="bot-1")])
+        self.assertTrue(self.plugin._group_is_directed(bot_reply))
+        other_reply = self.component_event([Reply(id="r2", sender_id="user-9")])
+        self.assertFalse(self.plugin._group_is_directed(other_reply))
+
+    async def test_reply_chain_at_bot_directs_when_sender_missing(self):
+        from astrbot.core.message.components import At, Reply
+        event = self.component_event([Reply(id="r3", sender_id=None, chain=[At(qq="bot-1")])])
+        self.assertTrue(self.plugin._group_is_directed(event))
+
+    async def test_adapter_without_components_keeps_outline_fallback(self):
+        event = FakeEvent(user_id="user-1", group_id="group-1", wake=False,
+                          outline="帮我看下 [At:bot-1] 这个")
+        self.assertTrue(self.plugin._group_is_directed(event))
+        event = FakeEvent(user_id="user-1", group_id="group-1", wake=False, outline="普通消息")
+        self.assertFalse(self.plugin._group_is_directed(event))
+
+    async def test_wake_still_directs_with_non_matching_components(self):
+        from astrbot.core.message.components import Plain
+        event = self.component_event([Plain("普通消息")])
+        event.wake = True
+        self.assertTrue(self.plugin._group_is_directed(event))
+
+
+class TurnContextPinTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-90: one request/response turn settles in its pinned context."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def turn_event(self, user_id="user-1", group_id="", message_id="turn-1"):
+        event = FakeEvent(user_id=user_id, group_id=group_id)
+        event.message_obj = type("Message", (), {"message_id": message_id})()
+        return event
+
+    def verdict_block(self, trust=4):
+        return ("<relation_judgment>{\"schema_version\":1,\"fact_effects\":[{\"effects\":{\"trust\":%d}}]}"
+                "</relation_judgment>回复") % trust
+
+    async def test_scope_flip_mid_turn_keeps_pinned_scope(self):
+        event = self.turn_event()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.plugin.config["is_global_relation"] = False
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+        self.assertIsNone(self.plugin.store.existing_account(
+            "qq-adapter:user-1", "session", str(event.unified_msg_origin)))
+
+    async def test_enabled_at_request_completes_old_turn_after_disable(self):
+        event = self.turn_event()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.plugin.config["enabled"] = False
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_disabled_at_request_stays_unsettled_after_enable(self):
+        event = self.turn_event()
+        self.plugin.config["enabled"] = False
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.plugin.config["enabled"] = True
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual("回复", FakeResponse(self.verdict_block()).completion_text.split("</relation_judgment>")[1])
+        self.assertIsNone(self.plugin.store.existing_account("qq-adapter:user-1", "global", ""))
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+    async def test_group_directed_flip_mid_turn_uses_request_time_decision(self):
+        from astrbot.core.message.components import At, Plain
+        self.plugin.config["group_require_at_or_reply"] = False
+        event = self.turn_event(group_id="group-1")
+        event.message_obj = type("Message", (), {"message_id": "m-at", "message": [Plain("随便聊聊"), At(qq="bot-1")]})()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.plugin.config["group_require_at_or_reply"] = True
+        # Request-time decision was directed (require was off); the pinned
+        # verdict keeps the old turn settleable.
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_group_undirected_at_request_stays_unsettled(self):
+        self.plugin.config["group_require_at_or_reply"] = True
+        event = self.turn_event(group_id="group-1")
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.plugin.config["group_require_at_or_reply"] = False
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+    async def test_same_message_id_different_users_both_settle(self):
+        alice = self.turn_event(user_id="alice", message_id="shared-id")
+        bob = self.turn_event(user_id="bob", message_id="shared-id")
+        await self.plugin.judge(alice, FakeResponse(self.verdict_block()))
+        await self.plugin.judge(bob, FakeResponse(self.verdict_block()))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:alice", "global", "")["values"]["trust"])
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:bob", "global", "")["values"]["trust"])
+
+    async def test_same_message_id_same_user_replays_idempotent(self):
+        event = self.turn_event(message_id="dup-id")
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        await self.plugin.judge(event, FakeResponse(self.verdict_block()))
+        self.assertEqual(404, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+        self.assertEqual(1, len(self.plugin.store.recent("qq-adapter:user-1", "global", "", 10)))
+
+    async def test_unstable_message_id_strips_without_settling(self):
+        event = self.turn_event(message_id="unknown")
+        response = FakeResponse(self.verdict_block())
+        await self.plugin.judge(event, response)
+        self.assertEqual("回复", response.completion_text)
+        self.assertIsNone(self.plugin.store.existing_account("qq-adapter:user-1", "global", ""))
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
