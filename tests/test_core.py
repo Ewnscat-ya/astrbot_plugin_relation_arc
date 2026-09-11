@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import time
@@ -87,6 +88,9 @@ class RelationArcCoreTests(unittest.TestCase):
             store.account("qq:display(42)","global","")
             store.account("qq:42","global","")
             store.account("qq:99","global","")
+            # Without the provable single admin adjustment the split is not actionable.
+            self.assertEqual([], store.legacy_identity_split_preview())
+            store.set_dimension("qq:display(42)","global","","trust",550)
             preview=store.legacy_identity_split_preview()
             self.assertEqual(1,len(preview)); self.assertEqual("qq:42",preview[0]["canonical_identity"])
             self.assertEqual(3,len(store.list_accounts()))
@@ -321,6 +325,120 @@ class RelationArcCoreTests(unittest.TestCase):
             profile = store.account('qq:special')
             self.assertEqual(special, profile['values'])
             self.assertEqual('committed', profile['state']['romance_state'])
+
+
+class SchemaVersionGuardTests(unittest.TestCase):
+    """MIS-89: never rewrite or open a database whose schema is newer."""
+
+    def test_future_schema_version_refuses_and_preserves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            store.account("qq:keep", "global", "")
+            db_path = Path(directory) / "relation_arc.sqlite3"
+            raw = sqlite3.connect(db_path)
+            raw.execute("PRAGMA user_version=10")
+            raw.commit()
+            raw.close()
+            with self.assertRaises(ValueError) as ctx:
+                RelationStore(Path(directory))
+            self.assertIn("future", str(ctx.exception))
+            check = sqlite3.connect(db_path)
+            version = check.execute("PRAGMA user_version").fetchone()[0]
+            kept = check.execute("SELECT identity FROM accounts WHERE identity='qq:keep'").fetchone()
+            check.close()
+            self.assertEqual(10, version)
+            self.assertIsNotNone(kept)
+
+    def test_corrupt_database_refused_and_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "relation_arc.sqlite3"
+            payload = b"this is definitely not a sqlite database" * 8
+            db_path.write_bytes(payload)
+            with self.assertRaises(RuntimeError):
+                RelationStore(Path(directory))
+            self.assertEqual(payload, db_path.read_bytes())
+
+
+class LegacyIdentityRepairGuardTests(unittest.TestCase):
+    """MIS-89: repair only provable admin display-name splits; keep ambiguous history."""
+
+    def _store_with_split(self, directory):
+        store = RelationStore(Path(directory))
+        store.account("qq:42", "global", "")
+        store.set_dimension("qq:42", "global", "", "trust", 400)
+        store.account("qq:display(42)", "global", "")
+        store.set_dimension("qq:display(42)", "global", "", "trust", 550)
+        return store
+
+    def test_repair_skips_when_llm_history_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_split(directory)
+            store.apply(event_id="llm-hist", identity="qq:display(42)", scope_kind="global", scope_id="",
+                        source_kind="private", evidence="real", reason="real",
+                        requested={"closeness": 2}, applied={"closeness": 2}, notes={}, actor="llm")
+            self.assertEqual([], store.legacy_identity_split_preview())
+            self.assertEqual([], store.repair_legacy_identity_splits())
+            self.assertIsNotNone(store.existing_account("qq:display(42)", "global", ""))
+            self.assertEqual(550, store.existing_account("qq:display(42)", "global", "")["values"]["trust"])
+            self.assertEqual(400, store.existing_account("qq:42", "global", "")["values"]["trust"])
+            self.assertIn("llm_or_other_history_present", store.legacy_identity_split_diagnostic_counts())
+
+    def test_repair_skips_when_binding_history_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_split(directory)
+            first = {"binding_id": "ghostbind", "type_key": "friend", "unique_scope": "", "origin": "test", "summary": ""}
+            _, status = store.apply_turn_with_binding(event_id="be1", identity="qq:display(42)", scope_kind="global",
+                                                      scope_id="", source_kind="private", evidence="", reason="",
+                                                      requested={}, applied={}, notes={}, binding=first)
+            self.assertEqual("binding_created", status)
+            self.assertEqual([], store.repair_legacy_identity_splits())
+            self.assertIsNotNone(store.existing_account("qq:display(42)", "global", ""))
+            self.assertEqual(1, len(store.list_bindings(status="active")))
+            self.assertIn("binding_history_present", store.legacy_identity_split_diagnostic_counts())
+
+    def test_repair_skips_with_timed_safety(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_split(directory)
+            _, status = store.apply_turn_with_binding(event_id="ts1", identity="qq:display(42)", scope_kind="global",
+                                                      scope_id="", source_kind="private", evidence="", reason="",
+                                                      requested={}, applied={}, notes={}, binding=None,
+                                                      timed_safety={"level": "slow_down", "duration_minutes": 30})
+            self.assertEqual("no_binding", status)
+            self.assertEqual([], store.repair_legacy_identity_splits())
+            self.assertIsNotNone(store.existing_account("qq:display(42)", "global", ""))
+            self.assertIn("timed_safety_present", store.legacy_identity_split_diagnostic_counts())
+
+    def test_repair_skips_with_settlement_blacklist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_split(directory)
+            store.blacklist_settlement("qq:display(42)", "global", "", "settlement_limit")
+            self.assertEqual([], store.repair_legacy_identity_splits())
+            self.assertIsNotNone(store.existing_account("qq:display(42)", "global", ""))
+            self.assertIn("blacklist_present", store.legacy_identity_split_diagnostic_counts())
+
+    def test_repair_is_idempotent_and_atomic_on_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            for suffix in ("42", "77"):
+                store.account(f"qq:{suffix}", "global", "")
+                store.account(f"qq:display({suffix})", "global", "")
+                store.set_dimension(f"qq:{suffix}", "global", "", "trust", 400)
+                store.set_dimension(f"qq:display({suffix})", "global", "", "trust", 600)
+            from unittest import mock
+            with mock.patch("astrbot_plugin_relation_arc.relation_store.time.time_ns", side_effect=[1, RuntimeError("interrupted")]):
+                with self.assertRaises(RuntimeError):
+                    store.repair_legacy_identity_splits()
+            for suffix in ("42", "77"):
+                self.assertIsNotNone(store.existing_account(f"qq:display({suffix})", "global", ""))
+                self.assertEqual(400, store.existing_account(f"qq:{suffix}", "global", "")["values"]["trust"])
+            repaired = store.repair_legacy_identity_splits()
+            self.assertEqual(2, len(repaired))
+            self.assertEqual(600, store.existing_account("qq:42", "global", "")["values"]["trust"])
+            self.assertEqual(600, store.existing_account("qq:77", "global", "")["values"]["trust"])
+            self.assertIsNone(store.existing_account("qq:display(42)", "global", ""))
+            self.assertIsNone(store.existing_account("qq:display(77)", "global", ""))
+            self.assertEqual([], store.repair_legacy_identity_splits())
+            self.assertEqual([], store.legacy_identity_split_preview())
 
 
 if __name__ == '__main__':

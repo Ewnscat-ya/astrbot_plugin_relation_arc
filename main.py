@@ -59,6 +59,10 @@ class RelationArc(Star):
         if repaired:
             # No identity, message, old/new value or admin target is logged.
             logger.warning("[关系弧线] repaired legacy admin identity splits count=%s backup=%s",len(repaired),snapshot.name)
+        diagnostics=self.store.legacy_identity_split_diagnostic_counts()
+        if diagnostics:
+            # Counts per reason code only; ambiguous history is kept untouched.
+            logger.warning("[关系弧线] skipped ambiguous identity splits reasons=%s",json.dumps(diagnostics,sort_keys=True))
 
     def _migrate_confirmed_legacy_binding(self) -> None:
         # This is intentionally narrower than a state-based bulk migration:

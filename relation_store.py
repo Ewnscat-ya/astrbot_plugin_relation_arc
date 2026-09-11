@@ -71,12 +71,28 @@ class RelationStore:
         existed = self.path.exists() and self.path.stat().st_size > 0
         old_version = 0
         if existed:
-            with self._connection() as conn:
-                old_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            # Read-only probe on a bare connection: no journal-mode or schema
+            # writes happen before the database's own version is known.
+            probe = sqlite3.connect(self.path, timeout=10)
+            try:
+                try:
+                    old_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+                except sqlite3.DatabaseError as exc:
+                    raise RuntimeError("relation database is not a readable SQLite file; refusing to open or modify it") from exc
+            finally:
+                probe.close()
+            if old_version > SCHEMA_VERSION:
+                # Never downgrade a newer database: refuse while the file keeps
+                # its version and data untouched.
+                raise ValueError(f"unsupported future database schema version {old_version}; this build supports up to {SCHEMA_VERSION}")
             migration_backup = self._sqlite_backup(self._backup_path("migration", f"schema_v{old_version}_to_v{SCHEMA_VERSION}")) if old_version < SCHEMA_VERSION else None
         else:
             migration_backup = None
         with self._connection() as conn:
+            # One explicit transaction: any failure rolls the whole schema
+            # change back, so an interrupted migration never leaves a
+            # half-upgraded database behind.
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("CREATE TABLE IF NOT EXISTS accounts (identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL DEFAULT '', values_json TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL, state_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(identity,scope_kind,scope_id))")
             conn.execute("CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, source_kind TEXT NOT NULL, evidence TEXT NOT NULL, reason TEXT NOT NULL, requested_json TEXT NOT NULL, applied_json TEXT NOT NULL, notes_json TEXT NOT NULL, actor TEXT NOT NULL, created_at REAL NOT NULL)")
             conn.execute("CREATE TABLE IF NOT EXISTS migration_log (id INTEGER PRIMARY KEY AUTOINCREMENT, component TEXT NOT NULL, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, backup_name TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)")
@@ -128,27 +144,75 @@ class RelationStore:
         except json.JSONDecodeError: state = {}
         return {"values": values, "state": {**RelationStore._legacy_default_state(), **state}, "paused": bool(row["paused"]), "revision": row["revision"], "last_interaction":float(row["last_interaction"]) if "last_interaction" in row.keys() else 0.0}
 
+    def _legacy_split_candidates(self, conn) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Shared eligibility for preview and repair (single source of truth).
+
+        A split is repairable only when the legacy account's entire history in
+        the scope is exactly one single-dimension administrator event and no
+        bindings, timed safety or blacklist rows reference it; anything else is
+        real history and is reported (counts only, never identities).
+        """
+        import re
+        rows = conn.execute("SELECT identity,scope_kind,scope_id,revision FROM accounts").fetchall()
+        existing = {(r["identity"], r["scope_kind"], r["scope_id"]) for r in rows}
+        repairable: list[dict[str, Any]] = []
+        diagnostics: dict[str, int] = {}
+        for row in rows:
+            identity = row["identity"]
+            if ":" not in identity:
+                continue
+            platform, suffix = identity.split(":", 1)
+            match = re.fullmatch(r".*\(([^()\s]+)\)", suffix)
+            if not match:
+                continue
+            canonical = f"{platform}:{match.group(1)}"
+            scope = (row["scope_kind"], row["scope_id"])
+            if (canonical, *scope) not in existing:
+                diagnostics["no_canonical_target"] = diagnostics.get("no_canonical_target", 0) + 1
+                continue
+            if conn.execute("SELECT 1 FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, *scope)).fetchone():
+                diagnostics["binding_history_present"] = diagnostics.get("binding_history_present", 0) + 1
+                continue
+            if conn.execute("SELECT 1 FROM timed_safety WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, *scope)).fetchone():
+                diagnostics["timed_safety_present"] = diagnostics.get("timed_safety_present", 0) + 1
+                continue
+            if conn.execute("SELECT 1 FROM settlement_blacklist WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, *scope)).fetchone():
+                diagnostics["blacklist_present"] = diagnostics.get("blacklist_present", 0) + 1
+                continue
+            events = conn.execute("SELECT actor,requested_json,applied_json FROM events WHERE identity=? AND scope_kind=? AND scope_id=?", (identity, *scope)).fetchall()
+            if len(events) != 1 or events[0]["actor"] != "administrator":
+                diagnostics["llm_or_other_history_present"] = diagnostics.get("llm_or_other_history_present", 0) + 1
+                continue
+            requested = json.loads(events[0]["requested_json"])
+            applied = json.loads(events[0]["applied_json"])
+            keys = set(requested) | set(applied)
+            if len(keys) != 1 or next(iter(keys)) not in DIMENSIONS:
+                diagnostics["admin_event_shape_mismatch"] = diagnostics.get("admin_event_shape_mismatch", 0) + 1
+                continue
+            repairable.append({"legacy_identity": identity, "canonical_identity": canonical, "scope_kind": scope[0], "scope_id": scope[1], "revision": row["revision"], "dimension": next(iter(keys))})
+        return repairable, diagnostics
+
     def legacy_identity_split_preview(self) -> list[dict[str, Any]]:
         """Read-only candidates shaped like ``platform:display(sender_id)``.
 
-        A candidate is actionable only when its canonical ``platform:sender_id``
-        exists in exactly the same scope. No mutation is performed here.
+        A candidate is listed only when a provable repair would apply: the
+        canonical row exists in exactly the same scope and the legacy account's
+        whole history is one single-dimension administrator event. No mutation
+        is performed here.
         """
-        import re
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT identity,scope_kind,scope_id,revision FROM accounts").fetchall()
-            existing={(r["identity"],r["scope_kind"],r["scope_id"]) for r in rows}
-        result=[]
-        for row in rows:
-            identity=row["identity"]
-            if ":" not in identity: continue
-            platform, suffix=identity.split(":",1)
-            match=re.fullmatch(r".*\(([^()\s]+)\)",suffix)
-            if not match: continue
-            canonical=f"{platform}:{match.group(1)}"
-            if (canonical,row["scope_kind"],row["scope_id"]) in existing:
-                result.append({"legacy_identity":identity,"canonical_identity":canonical,"scope_kind":row["scope_kind"],"scope_id":row["scope_id"],"revision":row["revision"]})
-        return result
+            repairable, _ = self._legacy_split_candidates(conn)
+        return [{key: item[key] for key in ("legacy_identity", "canonical_identity", "scope_kind", "scope_id", "revision")} for item in repairable]
+
+    def legacy_identity_split_diagnostic_counts(self) -> dict[str, int]:
+        """Sanitised skip reasons for shape-matched but non-repairable splits.
+
+        Values are counts per reason code; no identity, message, score or
+        evidence is ever included.
+        """
+        with self.lock, self._connection() as conn:
+            _, diagnostics = self._legacy_split_candidates(conn)
+        return dict(sorted(diagnostics.items()))
 
     def repair_legacy_identity_splits(self) -> list[dict[str, Any]]:
         """Apply only provable admin-created display(ID) splits atomically.
@@ -156,27 +220,20 @@ class RelationStore:
         The old administrator event recorded a delta even though UI semantics are
         absolute set.  We therefore copy only the changed dimension's final value
         from the legacy row to its canonical row, audit that repair, then delete
-        the legacy row and its administrator-only events. No LLM event is moved.
+        the legacy row and its administrator-only events. Accounts with LLM
+        history, bindings, timed safety or blacklist rows are never touched.
         """
         import re
         repaired=[]
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT identity,scope_kind,scope_id,values_json,state_json,revision FROM accounts").fetchall()
-            for row in rows:
-                identity=row["identity"]
-                if ":" not in identity: continue
-                platform,suffix=identity.split(":",1); match=re.fullmatch(r".*\(([^()\s]+)\)",suffix)
-                if not match: continue
-                canonical=f"{platform}:{match.group(1)}"; scope=(row["scope_kind"],row["scope_id"])
-                target=conn.execute("SELECT values_json,state_json,paused,revision FROM accounts WHERE identity=? AND scope_kind=? AND scope_id=?",(canonical,*scope)).fetchone()
-                if not target: continue
-                events=conn.execute("SELECT requested_json,applied_json FROM events WHERE identity=? AND scope_kind=? AND scope_id=? AND actor='administrator'",(identity,*scope)).fetchall()
-                # Strictly accept the observed one-event, one-dimension admin-only shape.
-                if len(events)!=1: continue
-                requested=json.loads(events[0]["requested_json"]); applied=json.loads(events[0]["applied_json"])
-                keys=set(requested)|set(applied)
-                if len(keys)!=1 or next(iter(keys)) not in DIMENSIONS: continue
-                dimension=next(iter(keys)); legacy_values=json.loads(row["values_json"]); target_values=json.loads(target["values_json"])
+            candidates, _ = self._legacy_split_candidates(conn)
+            for item in candidates:
+                identity=item["legacy_identity"]; canonical=item["canonical_identity"]
+                scope=(item["scope_kind"], item["scope_id"]); dimension=item["dimension"]
+                row=conn.execute("SELECT values_json FROM accounts WHERE identity=? AND scope_kind=? AND scope_id=?",(identity,*scope)).fetchone()
+                target=conn.execute("SELECT values_json,revision FROM accounts WHERE identity=? AND scope_kind=? AND scope_id=?",(canonical,*scope)).fetchone()
+                if row is None or target is None: continue
+                legacy_values=json.loads(row["values_json"]); target_values=json.loads(target["values_json"])
                 old=int(target_values.get(dimension,0)); final=int(legacy_values.get(dimension,0)); target_values[dimension]=final; now=time.time()
                 conn.execute("UPDATE accounts SET values_json=?,revision=?,updated_at=? WHERE identity=? AND scope_kind=? AND scope_id=?",(json.dumps(target_values),int(target["revision"])+1,now,canonical,*scope))
                 event_id=f"identity_repair:{hashlib.sha256(identity.encode()).hexdigest()[:16]}:{time.time_ns()}"

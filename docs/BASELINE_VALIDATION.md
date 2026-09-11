@@ -27,7 +27,9 @@ Mimosa L3 提交门禁在基线代码上报告两处高危，均已修复并验�
 
 修复后重跑 `tools/behavior_contract_samples.py`，输出与 `BEHAVIOR_CONTRACT.md` 记录逐字节一致（diff 为空）——行为基线不受影响。上游 Favour Ultra `storage.py` 已在快照 `2f2ec141` 直接核验（locked 重试装饰器、WAL、备份/恢复/衰减机制），详见 REUSE_DECISIONS.md 来源映射。
 
-## 测试执行结果（92 个方法：核心 31 / 入口 52 / P0 9）
+## 测试执行结果（99 个方法：核心 38 / 入口 52 / P0 9）
+
+MIS-87 时为 92 个方法；MIS-89 新增 7 个版本门禁与身份修复回归测试（复现先行：修复前 6 项失败，修复后全绿），现有 92 个方法零改动。
 
 | 环境 | 命令 | 结果 |
 | -- | -- | -- |
@@ -35,6 +37,7 @@ Mimosa L3 提交门禁在基线代码上报告两处高危，均已修复并验�
 | 虚拟环境 + astrbot 4.28.0 | `python -m unittest discover -s tests` | **92/92 通过**（4.6s） |
 | 虚拟环境 + astrbot 4.26.0（声明下限） | 同上 | **92/92 通过**（4.5s） |
 | 虚拟环境 + astrbot 4.27.0 | 同上 | **92/92 通过**（4.5s） |
+| 虚拟环境 + astrbot 4.28.0（MIS-89 后，99 方法） | 同上 | **99/99 通过**（4.6s） |
 
 - 既有失败：0。新回归：0。缺依赖：已通过安装 pip 发布包消除（仅宿主程序运行仍缺）。
 - 入口测试（test_main.py）使用宿主真实数据类（`ProviderRequest`/`Plain`/`MessageChain`）与 Fake 事件对象，属于"包级 API 兼容"证据；不等于真实 HTTP/适配器链路验收。
