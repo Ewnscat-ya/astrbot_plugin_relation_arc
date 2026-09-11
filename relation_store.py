@@ -100,7 +100,13 @@ class RelationStore:
             if old_version < SCHEMA_VERSION:
                 conn.execute("INSERT INTO migration_log(component,from_version,to_version,backup_name,created_at) VALUES(?,?,?,?,?)", ("sqlite", old_version, SCHEMA_VERSION, migration_backup.name if migration_backup else "", time.time()))
                 self.migration_events.append({"component":"sqlite", "from_version":old_version, "to_version":SCHEMA_VERSION, "backup":migration_backup.name if migration_backup else ""})
-            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            # SQLite PRAGMA cannot bind parameters, so the version literal is
+            # written directly and verified against SCHEMA_VERSION on read-back;
+            # any drift fails loudly instead of silently mislabelling a database.
+            conn.execute("PRAGMA user_version=9")
+            written = conn.execute("PRAGMA user_version").fetchone()[0]
+            if written != SCHEMA_VERSION:
+                raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")
 
     def _default_values(self) -> dict[str, int]:
         return {**DEFAULT_VALUES, **self.config.get("initial_values", {})}

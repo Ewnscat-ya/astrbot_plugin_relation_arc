@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.db
 *.sqlite*
+
+# Local tooling state (Mimosa scanner, host-created default data dir)
+.mimosa/
+data/

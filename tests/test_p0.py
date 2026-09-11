@@ -1,5 +1,6 @@
 """Host-free regression harness; executes real methods, not AstrBot integration."""
 import ast
+import importlib.util
 import json
 import logging
 from pathlib import Path
@@ -28,8 +29,21 @@ def load_methods():
             method.decorator_list = []
     module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), cls], type_ignores=[])
     namespace = dict(globals(), logger=logging.getLogger('p0'), Plain=Plain)
-    exec(compile(ast.fix_missing_locations(module), str(ROOT / 'main.py'), 'exec'), namespace)
-    return namespace['RelationArc']
+    # Host-free load of the decorator-stripped class: the transformed source is
+    # written to a temp file and imported through importlib, so methods resolve
+    # names against the same seeded globals as before. The file is removed once
+    # loaded; only this repository's own main.py source is ever loaded here.
+    with tempfile.TemporaryDirectory() as staging:
+        path = Path(staging) / 'relation_arc_p0_main.py'
+        path.write_text(ast.unparse(ast.fix_missing_locations(module)), encoding='utf-8')
+        spec = importlib.util.spec_from_file_location('relation_arc_p0_main', path)
+        loaded = importlib.util.module_from_spec(spec)
+        for key, value in namespace.items():
+            if key.startswith('__') and key.endswith('__'):
+                continue  # keep the loader-assigned module dunders intact
+            setattr(loaded, key, value)
+        spec.loader.exec_module(loaded)
+    return loaded.RelationArc
 
 
 class Plain:
