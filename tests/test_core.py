@@ -441,5 +441,62 @@ class LegacyIdentityRepairGuardTests(unittest.TestCase):
             self.assertEqual([], store.legacy_identity_split_preview())
 
 
+class ProtocolHardeningTests(unittest.TestCase):
+    """MIS-91: parse budgets and explicit truncated-block contract."""
+
+    def _block(self, inner: str) -> str:
+        return f"<relation_judgment>{inner}</relation_judgment>"
+
+    def test_oversized_block_rejected_but_stripped(self):
+        inner = '{"schema_version":1,"fact_effects":[],"note":"' + "x" * 70000 + '"}'
+        result = parse_response("可见" + self._block(inner), "x", 10)
+        self.assertEqual("invalid_json", result.error)
+        self.assertEqual("可见", result.clean_text)
+        self.assertEqual([], result.effects)
+
+    def test_fact_items_beyond_budget_are_truncated(self):
+        items = ",".join('{"effects":{"trust":1}}' for _ in range(100))
+        result = parse_response(self._block('{"schema_version":1,"fact_effects":[%s]}' % items), "x", 10)
+        self.assertIsNone(result.error)
+        self.assertEqual(64, len(result.effects))
+        self.assertEqual(36, result.stats["truncated_items"])
+
+    def test_deep_nesting_does_not_crash(self):
+        deep = '{"schema_version":1,"fact_effects":' + "[" * 3000 + "]" * 3000 + "}"
+        result = parse_response(self._block(deep), "x", 10)
+        self.assertIsNotNone(result.error)
+        self.assertEqual([], result.effects)
+
+    def test_multiple_blocks_last_payload_wins_and_all_stripped(self):
+        text = ("开头" + self._block('{"schema_version":1,"fact_effects":[{"effects":{"trust":5}}]}')
+                + "中段" + self._block('{"schema_version":1,"fact_effects":[{"effects":{"comfort":-3}}]}') + "结尾")
+        result = parse_response(text, "x", 10)
+        self.assertIsNone(result.error)
+        self.assertEqual({"comfort": -3}, result.effects[0]["effects"])
+        self.assertEqual("开头中段结尾", result.clean_text)
+        self.assertEqual(2, result.stats["blocks"])
+
+    def test_truncated_tail_opener_is_removed(self):
+        text = '可见回复。<relation_judgment>{"schema_version":1,'
+        result = parse_response(text, "x", 10)
+        self.assertEqual("可见回复。", result.clean_text)
+        self.assertIsNone(result.error)
+        self.assertEqual([], result.effects)
+
+    def test_mid_text_unclosed_opener_is_kept_and_not_settled(self):
+        text = "前文 <relation_judgment>{\"broken\": true} 后续正文"
+        result = parse_response(text, "x", 10)
+        self.assertIn("<relation_judgment>", result.clean_text)
+        self.assertIsNone(result.error)
+        self.assertEqual([], result.effects)
+
+    def test_ordinary_json_code_sample_is_not_swallowed(self):
+        text = '看这个例子：\n{"schema_version": 9, "fact_effects": []}\n完毕'
+        result = parse_response(text, "x", 10)
+        self.assertIsNone(result.error)
+        self.assertIn('"schema_version": 9', result.clean_text)
+        self.assertEqual([], result.effects)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -5,7 +5,7 @@
 后续任务若需改变以下任何行为，必须满足行为合同的独立决策流程（前后案例 + 迁移回滚说明），并同步更新本文件与脚本。
 
 - 生成环境：Python 3.12.10 + AstrBot 4.28.0（pip 包，仅作依赖与数据类来源）+ SQLite 3.49.1
-- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（126 个方法，见 BASELINE_VALIDATION.md）
+- 证据测试：`tests/test_core.py`、`tests/test_p0.py`、`tests/test_main.py`（137 个方法，见 BASELINE_VALIDATION.md）
 - 复跑方式：见 `docs/BASELINE_VALIDATION.md` 的"从新环境重建"
 
 ## 样例输出（脚本实际运行结果）
@@ -119,3 +119,12 @@
 
 - 正常路径（无中途翻转）的计分、冷却、绑定、安全语义与上文合同完全一致；此附录只定义"配置翻转竞态"这一此前未定义的行为。
 - 定向识别改为真实 At/Reply 组件：伪造 `[At:...]` 文本、回复他人不再触发；无结构化组件的适配器保留 outline best-effort 回退并保留 wake 语义。
+## 附录二：协议清理契约（MIS-91 起生效）
+
+- **完整块**：所有 `<relation_judgment>...</relation_judgment>` 完整块无条件从可见输出剥离；多块时取**最后一个**完整块载荷结算。
+- **尾部截断**：文末出现无闭合的 opener 且其后是以 `{` 开头、无法完整 JSON 解析的残片 → 判定为流式截断的协议尾巴，opener 起整段移除；残片可完整解析（如代码示例里的完整 JSON）则保留。
+- **中部未闭合**：opener 后跟随普通内容的一律保留原样，绝不吞普通文本/代码/JSON；结算层按无效协议拒绝。
+- **裸 JSON 恢复**：仅限回复最开头、schema 恰为 v1/v2/v3 且 fact_effects 为 list 的对象；其余开头的普通 JSON 一律不动。
+- **预算**：单块内容 >64KB 记 oversize 拒绝结算（仍剥离显示）；fact 条目 >64 只取前 64（记 truncated_items）；深嵌套由 RecursionError 防护。
+- **富消息链**：逐 Plain 部件独立清理、原位保留（图片/文本/引用顺序不变）；协议块跨部件分裂时回退"合并到首部件"（正确性优先）；禁用结算时清理照旧。
+- **流式**：结算与清理位于宿主最终响应 hook；早期片段泄漏需真实宿主验证（未覆盖，见 HOST_COMPATIBILITY.md）。

@@ -27,15 +27,15 @@ Mimosa L3 提交门禁在基线代码上报告两处高危，均已修复并验�
 
 修复后重跑 `tools/behavior_contract_samples.py`，输出与 `BEHAVIOR_CONTRACT.md` 记录逐字节一致（diff 为空）——行为基线不受影响。上游 Favour Ultra `storage.py` 已在快照 `2f2ec141` 直接核验（locked 重试装饰器、WAL、备份/恢复/衰减机制），详见 REUSE_DECISIONS.md 来源映射。
 
-## 测试执行结果（126 个方法：核心 38 / 入口 65 / P0 9 / 宿主兼容 13）
+## 测试执行结果（137 个方法：核心 45 / 入口 70 / P0 9 / 宿主兼容 13）
 
-92（MIS-87 基线）→ 99（MIS-89 新增 7 个版本门禁与身份修复回归，复现先行）→ 112（MIS-88 新增 13 个宿主兼容回归，走宿主真实 Quart 兼容桥）→ 126（MIS-90 新增 14 个群定向与轮次上下文回归，复现先行：修复前 7 项失败）。现有方法零改动、零删除。
+92（MIS-87 基线）→ 99（MIS-89 新增 7 个版本门禁与身份修复回归，复现先行）→ 112（MIS-88 新增 13 个宿主兼容回归，走宿主真实 Quart 兼容桥）→ 126（MIS-90 新增 14 个群定向与轮次上下文回归，复现先行：修复前 7 项失败）→ 137（MIS-91 新增 11 个协议预算/截断契约/富消息顺序回归，复现先行：修复前 7 项失败）。现有方法零改动、零删除。
 
 | 环境 | 命令 | 结果 |
 | -- | -- | -- |
 | 无宿主包（系统 Python） | `python -m unittest tests.test_core tests.test_p0` | 40/40 通过（1.8s）；test_main/test_host_compat 因缺 `astrbot` 包导入失败/跳过 → 记为**缺依赖**，非用例失败 |
-| 虚拟环境 + astrbot 4.28.0 | `python -m unittest discover -s tests` | **126/126 通过**（5.4s） |
-| 虚拟环境 + astrbot 4.26.0（声明下限） | 同上 | **126/126 通过**（5.4s） |
+| 虚拟环境 + astrbot 4.28.0 | `python -m unittest discover -s tests` | **137/137 通过**（5.6s） |
+| 虚拟环境 + astrbot 4.26.0（声明下限） | 同上 | **137/137 通过**（5.7s） |
 | 虚拟环境 + astrbot 4.27.0 | 同上（MIS-87 时 92 方法） | **92/92 通过**（4.5s） |
 | 虚拟环境 + astrbot 4.28.0（MIS-89 后，99 方法） | 同上 | **99/99 通过**（4.6s） |
 
@@ -47,7 +47,7 @@ Mimosa L3 提交门禁在基线代码上报告两处高危，均已修复并验�
 
 1. 取得仓库并检出基线 commit。
 2. 创建独立虚拟环境：`python -m venv .venv`（仓库外），激活后 `pip install astrbot`（当前 4.28.0；验证下限用 `pip install astrbot==4.26.0`）。
-3. 在仓库目录运行：`python -m unittest discover -s tests -v` → 应为 `Ran 126 tests ... OK`。
+3. 在仓库目录运行：`python -m unittest discover -s tests -v` → 应为 `Ran 137 tests ... OK`。
 4. 生成行为合同样例：`python tools/behavior_contract_samples.py` → 输出应与 `docs/BEHAVIOR_CONTRACT.md` 记录一致（数字确定性，不含时间戳）。
 5. 无 astrbot 包时仅能运行 `python -m unittest tests.test_core tests.test_p0`（40 个），此时不要把其余测试标记为失败。
 

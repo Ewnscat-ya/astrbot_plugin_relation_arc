@@ -19,7 +19,7 @@ from .relation_engine import (
     DIMENSIONS, PUBLIC_DIMENSIONS, DISPLAY, aggregate_effects, apply_delta,
     behavior_projection,
 )
-from .relation_protocol import BLOCK, parse_response
+from .relation_protocol import BLOCK, leading_bare_json_span, parse_response, strip_protocol_text
 from .relation_store import RelationStore
 from .relationship_types import get_type, projected_eligibility, public_directory
 
@@ -302,8 +302,9 @@ class RelationArc(Star):
         the text payload with the protocol-stripped version.
         """
         result_chain = getattr(response, "result_chain", None)
-        plain_parts = list(getattr(result_chain, "chain", []) or []) if result_chain else []
-        plain_text = "\n".join(part.text for part in plain_parts if isinstance(part, Plain) and isinstance(part.text, str) and part.text)
+        chain_parts = list(getattr(result_chain, "chain", []) or []) if result_chain else []
+        plain_parts = [part for part in chain_parts if isinstance(part, Plain) and isinstance(part.text, str)]
+        plain_text = "\n".join(part.text for part in plain_parts if part.text)
         text_source = "result_chain" if plain_text.strip() else "completion_text"
         completion = getattr(response, "completion_text", "")
         text = plain_text if plain_text.strip() else (completion if isinstance(completion, str) else "")
@@ -312,23 +313,48 @@ class RelationArc(Star):
         # recovered by the parser and treated as protocol, never user-visible prose.
         has_protocol = bool(BLOCK.search(text) or (parsed.stats or {}).get("bare"))
         if plain_text.strip():
-            # The host's final result chain is the outgoing payload.  The
-            # provider normally emits one Plain part; squash text only when a
-            # protocol block was actually present so ordinary rich replies keep
-            # their original component ordering.
-            if parsed.clean_text != text.strip():
-                replacement_done = False
-                new_chain = []
-                for part in result_chain.chain:
-                    if isinstance(part, Plain):
-                        if not replacement_done and parsed.clean_text:
-                            new_chain.append(Plain(parsed.clean_text))
-                            replacement_done = True
-                        # Drop all original Plain parts: their joined content
-                        # has been replaced above after stripping the control block.
-                        continue
-                    new_chain.append(part)
-                result_chain.chain = new_chain
+            # The host's final result chain is the outgoing payload.  Strip each
+            # Plain part in place so component order (image between texts, a
+            # quote after text) survives protocol removal; only a protocol block
+            # split across parts falls back to squashing into the first slot.
+            if has_protocol or parsed.clean_text != text.strip():
+                cleaned_parts = [strip_protocol_text(part.text) for part in plain_parts]
+                if parsed.stats and parsed.stats.get("bare"):
+                    for index, part in enumerate(plain_parts):
+                        if not part.text.strip():
+                            continue
+                        span = leading_bare_json_span(part.text)
+                        if span:
+                            cleaned_parts[index] = (part.text[:span[0]] + part.text[span[1]:]).strip()
+                        break
+                joined_cleaned = "\n".join(cleaned_parts)
+                # Any surviving tag fragment (e.g. an opener removed here but
+                # closed in a later part) means the block spans parts: squash
+                # into the first slot, matching the pre-per-part contract.
+                if BLOCK.search(joined_cleaned) or "relation_judgment" in joined_cleaned:
+                    replacement_done = False
+                    new_chain = []
+                    for part in result_chain.chain:
+                        if isinstance(part, Plain):
+                            if not replacement_done and parsed.clean_text:
+                                new_chain.append(Plain(parsed.clean_text))
+                                replacement_done = True
+                            # Drop all original Plain parts: their joined content
+                            # has been replaced above after stripping the control block.
+                            continue
+                        new_chain.append(part)
+                    result_chain.chain = new_chain
+                else:
+                    cleaned_iter = iter(cleaned_parts)
+                    new_chain = []
+                    for part in result_chain.chain:
+                        if isinstance(part, Plain):
+                            cleaned = next(cleaned_iter, "")
+                            if cleaned.strip():
+                                new_chain.append(Plain(cleaned))
+                            continue
+                        new_chain.append(part)
+                    result_chain.chain = new_chain
         else:
             response.completion_text = parsed.clean_text
         return parsed, has_protocol, text_source, bool(text.strip())

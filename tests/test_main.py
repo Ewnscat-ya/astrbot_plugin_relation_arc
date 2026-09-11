@@ -713,5 +713,65 @@ class TurnContextPinTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
 
 
+class RichChainStripTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-91: protocol cleanup must keep component order (image between texts)."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    @staticmethod
+    def verdict(trust=2):
+        return ("<relation_judgment>{\"schema_version\":1,\"fact_effects\":[{\"effects\":{\"trust\":%d}}]}"
+                "</relation_judgment>") % trust
+
+    async def test_image_between_plains_keeps_order_and_settles(self):
+        chain = MessageChain([Plain("前文。"), "image-component",
+                              Plain(self.verdict() + "后文。")])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        texts = [part.text for part in chain.chain if isinstance(part, Plain)]
+        self.assertEqual(["前文。", "后文。"], texts)
+        self.assertIn("image-component", chain.chain)
+        self.assertEqual(402, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_chain_stripped_even_when_settlement_disabled(self):
+        self.plugin.config["llm_judgment_enabled"] = False
+        chain = MessageChain([Plain("前文。" + self.verdict() + "后文。")])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        self.assertEqual([Plain("前文。后文。")], chain.chain)
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+    async def test_cross_part_block_falls_back_without_leak(self):
+        chain = MessageChain([Plain("前文。<relation_judgment>{\"schema_version\":1,"),
+                              Plain("\"fact_effects\":[{\"effects\":{\"trust\":3}}]}</relation_judgment>后文。")])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        joined = "\n".join(part.text for part in chain.chain if isinstance(part, Plain))
+        self.assertNotIn("relation_judgment", joined)
+        self.assertEqual(403, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_truncated_tail_opener_removed_from_chain(self):
+        chain = MessageChain([Plain("可见回复。<relation_judgment>{\"schema_version\":1,")])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        self.assertEqual([Plain("可见回复。")], chain.chain)
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
