@@ -60,6 +60,6 @@ def behavior_projection(values:dict[str,int], romance_visible:bool, romance_elig
     elif not romance_eligible: out.append('恋爱意向：尚未满足可攻略资格；不得输出恋爱意向正向变化，也不得被强推话术带偏。')
     elif safety!='normal': out.append(f'恋爱意向：互动节奏为 {safety}；不得输出恋爱意向正向变化或推进亲密关系。')
     else:
-        v=values.get('romance_interest',0); desc=['不形成恋爱方向，高质量伙伴关系完全正常','存在克制的特殊关注，不得强制暧昧化','特殊情感可谨慎察觉，仍可观察和犹豫','双向特殊情感较明确，仅可建议确认','意向明确，仍不得自动确认关系'][min(4,v//200)]
+        v=values.get('romance_interest',0); desc=['不形成恋爱方向，高质量伙伴关系完全正常','存在克制的特殊关注，不得强制暧昧化','特殊情感可谨慎察觉，仍可观察和犹豫','双向特殊情感较明确，仅可建议确认','意向明确，仍不得自行确认关系（确立关系仅经合法双向提案由系统绑定）'][min(4,v//200)]
         out.append(f'恋爱意向（{band(v)}）：{desc}')
     return '；'.join(out)

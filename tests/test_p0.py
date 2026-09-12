@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT.parent))
 from astrbot_plugin_relation_arc.relation_engine import DIMENSIONS, aggregate_effects, apply_delta
 from astrbot_plugin_relation_arc.relation_protocol import BLOCK, leading_bare_json_span, parse_response, strip_protocol_text
 from astrbot_plugin_relation_arc.relation_store import RelationStore
-from astrbot_plugin_relation_arc.relationship_types import get_type, projected_eligibility
+from astrbot_plugin_relation_arc.relationship_types import get_type, projected_eligibility, public_directory
 from astrbot_plugin_relation_arc.config_manager import PluginConfigManager
 
 

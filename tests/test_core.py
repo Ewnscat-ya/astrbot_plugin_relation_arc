@@ -641,5 +641,72 @@ class SettlementAtomicityTests(unittest.TestCase):
             self.assertEqual([], store.recent("qq:x", "global", "", 10))
 
 
+class BindingPolicyTests(unittest.TestCase):
+    """MIS-94: cooldown is auditable; inject lists the single type directory."""
+
+    def _policy(self, cooldowns=None):
+        return {
+            "repeat_window_minutes": 180,
+            "repeat_factors": [1.0],
+            "anti_farm": {"rolling_window_hours": 24,
+                          "positive_change_ceiling": {"trust": 50, "respect": 50,
+                                                      "comfort": 40, "closeness": 30,
+                                                      "resonance": 30, "romance_interest": 15}},
+            "safety_mode": "administrator_only",
+            "auto_duration_minutes": 30,
+            "type_cooldown_hours": cooldowns or {},
+        }
+
+    @staticmethod
+    def _friend_binding(binding_id):
+        return {"binding_id": binding_id, "type_key": "friend", "unique_scope": "",
+                "origin": "mutual_dialogue", "summary": ""}
+
+    def _settle(self, store, event_id, policy, binding):
+        return store.settle_turn(
+            event_id=event_id, identity="qq:cd", scope_kind="global", scope_id="",
+            source_kind="private", evidence="mutual", reason="mutual",
+            requested_all={"trust": 2}, fact_signature='{"trust": 2}',
+            safety_proposal=None, policy=policy,
+            romance_gate=lambda values, state: True,
+            binding_gate=lambda projected, state: (binding, "eligible"))
+
+    def test_cooldown_blocks_rebind_until_elapsed(self):
+        from unittest import mock
+        import astrbot_plugin_relation_arc.relation_store as store_mod
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._policy(cooldowns={"friend": 24})
+            _, status, _ = self._settle(store, "c1", policy, self._friend_binding("b1"))
+            self.assertEqual("committed", status)
+            self.assertTrue(store.end_binding("b1", "test"))
+            _, status, info = self._settle(store, "c2", policy, self._friend_binding("b2"))
+            self.assertEqual("committed", status)
+            self.assertEqual("binding_rejected:cooldown", info["status"])
+            active_ids = {b["binding_id"] for b in store.active_bindings_for("qq:cd", "global", "")}
+            self.assertNotIn("b2", active_ids)
+            # A different type has no cooldown entry and binds immediately.
+            _, status, info = self._settle(store, "c3", policy, {**self._friend_binding("b3"), "type_key": "partner"})
+            self.assertEqual("binding_created", info["status"])
+            # After the cooldown elapses the same type binds again.
+            real_time = store_mod.time
+            class Shifted:
+                def __init__(self, offset): self.offset = offset
+                def time(self): return real_time.time() + self.offset
+            with mock.patch.object(store_mod, "time", Shifted(25 * 3600)):
+                _, status, info = self._settle(store, "c4", policy, self._friend_binding("b4"))
+            self.assertEqual("binding_created", info["status"])
+
+    def test_cooldown_reason_is_structured_in_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._policy(cooldowns={"friend": 24})
+            self._settle(store, "k1", policy, self._friend_binding("kb1"))
+            store.end_binding("kb1", "test")
+            _, status, info = self._settle(store, "k2", policy, self._friend_binding("kb2"))
+            notes = info["notes"]
+            self.assertEqual(["binding_rejected:cooldown"], notes["binding"]["notes"])
+
+
 if __name__ == '__main__':
     unittest.main()

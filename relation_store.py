@@ -452,7 +452,19 @@ class RelationStore:
                     notes = {**notes, "binding": {"notes": ["binding_rejected:duplicate"]}}
                     binding_status = "binding_rejected:duplicate"
                 else:
-                    binding_status = "binding_created"
+                    # MIS-94: type cooldown counts from the latest ended_at of
+                    # the same identity/type/scope; ended history is kept and
+                    # only the most recent one decides. Durations come from the
+                    # caller's single type directory via policy.
+                    cooldown_hours = int((policy.get("type_cooldown_hours") or {}).get(binding["type_key"], 0))
+                    last_ended = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='ended' ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone()
+                    if (cooldown_hours > 0 and last_ended is not None and last_ended["ended_at"] is not None
+                            and now - float(last_ended["ended_at"]) < cooldown_hours * 3600):
+                        binding = None
+                        notes = {**notes, "binding": {"notes": ["binding_rejected:cooldown"]}}
+                        binding_status = "binding_rejected:cooldown"
+                    else:
+                        binding_status = "binding_created"
             if not paused:
                 for key, delta in applied.items():
                     if key in DIMENSIONS:
