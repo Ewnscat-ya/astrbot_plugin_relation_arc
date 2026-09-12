@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -921,6 +922,72 @@ class QueryVisibilityTests(unittest.IsolatedAsyncioTestCase):
         timed = store.active_timed_safety(identity, "global", "")
         self.assertIsNone(timed)
         self.assertEqual("pause_intimacy", store.effective_interaction_safety(identity, "global", ""))
+
+
+class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-95: managed backup task, cycle rotation, full snapshot manifest."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_backup_task_single_instance_across_restarts(self):
+        first = self.plugin._backup_task
+        self.assertIsNotNone(first)
+        await self.plugin._restart_schedulers()
+        self.assertIsNotNone(self.plugin._backup_task)
+        self.assertIsNot(first, self.plugin._backup_task)
+        self.assertTrue(first.cancelled() or first.done())
+        self.assertIs(self.plugin._decay_task, self.plugin._decay_task)
+
+    async def test_disabled_backup_creates_no_task(self):
+        self.plugin.config["backup"]["enabled"] = False
+        await self.plugin._restart_schedulers()
+        self.assertIsNone(self.plugin._backup_task)
+
+    async def test_backup_cycle_creates_auto_and_rotates(self):
+        import os
+        auto_dir = Path(self.temp.name) / "plugin_data" / "astrbot_plugin_relation_arc" / "backups" / "auto"
+        auto_dir.mkdir(parents=True, exist_ok=True)
+        stale = auto_dir / "stale.sqlite3"
+        stale.write_bytes(b"old backup bytes")
+        old_stamp = time.time() - 5 * 3600
+        os.utime(stale, (old_stamp, old_stamp))
+        self.plugin.config["backup"]["retention_hours"] = 1
+        self.plugin._run_backup_cycle()
+        self.assertTrue(self.plugin._backup_state["last_success"])
+        self.assertIsNone(self.plugin._backup_state["last_error"])
+        self.assertFalse(stale.exists())
+        self.assertTrue(any(p.name.endswith(".sqlite3") and p.name != "stale.sqlite3" for p in auto_dir.iterdir()))
+
+    async def test_full_backup_snapshot_has_verifiable_manifest(self):
+        import json as jsonlib
+        sqlite_path = self.plugin._create_full_backup("manual")
+        stem = sqlite_path.stem
+        base = sqlite_path.parent
+        config_copy = base / (stem + ".config.json")
+        manifest_path = base / (stem + ".manifest.json")
+        self.assertTrue(config_copy.is_file())
+        self.assertTrue(manifest_path.is_file())
+        manifest = jsonlib.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual("ok", manifest["integrity"])
+        self.assertEqual(10, manifest["schema_version"])
+        self.assertEqual(6, manifest["config_version"])
+
+    async def test_backups_api_surfaces_scheduler_state(self):
+        from quart import Quart
+        self.plugin._run_backup_cycle()
+        app = Quart(__name__)
+        async with app.test_request_context("/backups"):
+            result = await self.plugin._api_backups()
+        import json as jsonlib
+        payload = jsonlib.loads(await result.get_data())
+        self.assertTrue(payload["scheduler"]["last_success"])
 
 
 if __name__ == "__main__":

@@ -708,5 +708,91 @@ class BindingPolicyTests(unittest.TestCase):
             self.assertEqual(["binding_rejected:cooldown"], notes["binding"]["notes"])
 
 
+class BackupRestoreTests(unittest.TestCase):
+    """MIS-95: prechecked restore, full-state recovery, failure rollback."""
+
+    def _seed(self, store):
+        store.account("qq:a", "global", "")
+        store.set_dimension("qq:a", "global", "", "trust", 600)
+        store.apply(event_id="seed-ev", identity="qq:a", scope_kind="global", scope_id="",
+                    source_kind="private", evidence="e", reason="r",
+                    requested={"trust": 2}, applied={"trust": 2}, notes={}, actor="llm")
+        store.apply_turn_with_binding(
+            event_id="seed-b", identity="qq:a", scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding={"binding_id": "seed-bid", "type_key": "friend",
+                               "unique_scope": "", "origin": "t", "summary": ""})
+        store.apply_turn_with_binding(
+            event_id="seed-ts", identity="qq:a", scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding=None,
+            timed_safety={"level": "slow_down", "duration_minutes": 60})
+        store.blacklist_settlement("qq:a", "global", "", "settlement_limit")
+
+    def test_restore_rejects_corrupt_future_and_out_of_bounds(self):
+        for case in ("corrupt", "future", "zero"):
+            with tempfile.TemporaryDirectory() as directory:
+                store = RelationStore(Path(directory))
+                self._seed(store)
+                store.backup_now("manual")
+                expected_revision = store.existing_account("qq:a", "global", "")["revision"]
+                backup_file = next((Path(directory) / "backups" / "manual").glob("*.sqlite3"))
+                import sqlite3
+                raw = sqlite3.connect(backup_file)
+                if case == "corrupt":
+                    raw.close()
+                    backup_file.write_bytes(b"junk" * 512)
+                elif case == "future":
+                    raw.execute("PRAGMA user_version=11")
+                    raw.commit(); raw.close()
+                else:
+                    raw.execute("PRAGMA user_version=0")
+                    raw.commit(); raw.close()
+                with self.assertRaises(ValueError, msg=case):
+                    store.restore_backup(backup_file.name, kind="manual")
+                # Current database untouched by the rejected restore.
+                account = store.existing_account("qq:a", "global", "")
+                self.assertEqual(602, account["values"]["trust"])
+                self.assertEqual(expected_revision, account["revision"])
+
+    def test_restore_recovers_full_synthetic_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed(store)
+            backup = store.backup_now("manual")
+            # Perturb after the backup: new account, event, ended binding, cleared safety/blacklist.
+            store.account("qq:b", "global", "")
+            store.set_dimension("qq:a", "global", "", "trust", 100)
+            store.end_binding("seed-bid", "test")
+            store.set_interaction_safety_admin("qq:a", "global", "", "normal")
+            store.clear_settlement_blacklist("qq:a", "global", "")
+            store.restore_backup(backup.name, kind="manual")
+            account = store.existing_account("qq:a", "global", "")
+            self.assertEqual(602, account["values"]["trust"])
+            self.assertIsNone(store.existing_account("qq:b", "global", ""))
+            self.assertEqual(1, len(store.active_bindings_for("qq:a", "global", "")))
+            self.assertEqual("slow_down", store.active_timed_safety("qq:a", "global", "")["level"])
+            self.assertTrue(store.is_settlement_blacklisted("qq:a", "global", ""))
+            self.assertIn("seed-ev", [row["event_id"] for row in store.recent("qq:a", "global", "", 50)])
+
+    def test_restore_failure_leaves_current_database_intact(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed(store)
+            backup = store.backup_now("manual")
+            store.set_dimension("qq:a", "global", "", "trust", 100)
+            before = store.existing_account("qq:a", "global", "")["values"]["trust"]
+            before_revision = store.existing_account("qq:a", "global", "")["revision"]
+            with mock.patch.object(store, "_copy_into_live", side_effect=RuntimeError("injected io failure")):
+                with self.assertRaises(RuntimeError):
+                    store.restore_backup(backup.name, kind="manual")
+            after = store.existing_account("qq:a", "global", "")
+            self.assertEqual(before, after["values"]["trust"])
+            self.assertEqual(before_revision, after["revision"])
+            # The pre-restore snapshot exists for manual recovery.
+            self.assertTrue(any(item["kind"] == "pre_restore" for item in store.list_backups()))
+
+
 if __name__ == '__main__':
     unittest.main()

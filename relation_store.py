@@ -785,12 +785,43 @@ class RelationStore:
             if path.stat().st_mtime < cutoff: path.unlink(); cleaned+=1
         return cleaned
 
-    def restore_backup(self, name: str, kind: str = "manual") -> None:
+    def restore_backup(self, name: str, kind: str = "manual") -> dict[str, Any]:
+        """MIS-95: prechecked, transactional restore via the SQLite backup API.
+
+        The source must pass an integrity check and carry a supported schema
+        version (1..SCHEMA_VERSION) or it is rejected before the live database
+        is touched. A protected pre_restore snapshot is taken first; the
+        restore copies page-by-page inside the lock, so a failure leaves the
+        live database exactly as it was (WAL handled by SQLite itself)."""
         if kind not in BACKUP_KINDS: raise ValueError("unknown backup kind")
         source=(self.backup_dir/kind/Path(name).name).resolve(); parent=(self.backup_dir/kind).resolve()
         if source.parent != parent or not source.is_file(): raise ValueError("backup not found")
+        probe=sqlite3.connect(source)
+        try:
+            try:
+                integrity=probe.execute("PRAGMA integrity_check").fetchone()[0]
+                version=int(probe.execute("PRAGMA user_version").fetchone()[0])
+            except sqlite3.DatabaseError as exc:
+                raise ValueError("backup file is not a readable SQLite database") from exc
+        finally:
+            probe.close()
+        if integrity != "ok":
+            raise ValueError(f"backup failed integrity check: {integrity}")
+        if not 1 <= version <= SCHEMA_VERSION:
+            raise ValueError(f"unsupported backup schema version {version}; this build supports 1..{SCHEMA_VERSION}")
         self.backup_now("pre_restore")
-        with self.lock: shutil.copy2(source,self.path)
+        self._copy_into_live(source)
+        return {"schema_version": version, "integrity": "ok"}
+
+    def _copy_into_live(self, source: Path) -> None:
+        """Page-by-page copy from a backup file into the live database."""
+        with self.lock:
+            target=sqlite3.connect(self.path, timeout=10)
+            source_conn=sqlite3.connect(source)
+            try:
+                source_conn.backup(target)
+            finally:
+                source_conn.close(); target.close()
 
     def set_state(self, identity: str, scope_kind: str, scope_id: str, **changes: str) -> dict[str, Any]:
         allowed={"romance_policy","romance_state","interaction_safety"}

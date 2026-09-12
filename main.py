@@ -42,12 +42,24 @@ class RelationArc(Star):
         self.admins = {str(item) for item in host_config.get("admins_id", [])}
         self.store = RelationStore(data_root / "plugin_data" / PLUGIN_NAME, self.config)
         self._decay_task: asyncio.Task | None = None
+        self._backup_task: asyncio.Task | None = None
+        self._backup_state: dict[str, Any] = {}
         self._repair_legacy_identity_splits()
         self._migrate_confirmed_legacy_binding()
         self._log_startup_migrations()
         self._register_page_apis()
         if self.config.get("decay",{}).get("enabled"):
-            self._decay_task=asyncio.create_task(self._decay_loop(),name="relation-arc-decay")
+            self._decay_task=self._spawn(self._decay_loop(),"relation-arc-decay")
+        if self.config.get("backup",{}).get("enabled"):
+            self._backup_task=self._spawn(self._backup_loop(),"relation-arc-backup")
+
+    def _spawn(self, coro, name: str):
+        """Create a managed task when a loop is running; sync embedding (tests,
+        exotic loaders) simply skips the background schedulers."""
+        try:
+            return asyncio.create_task(coro, name=name)
+        except RuntimeError:
+            return None
 
     def _repair_legacy_identity_splits(self) -> None:
         # This repair deletes legacy ghost rows. A same-schema restart does not
@@ -778,21 +790,75 @@ class RelationArc(Star):
                 logger.exception("[关系弧线] decay scheduler failed; retrying")
             await asyncio.sleep(max(1,int(self.config["decay"]["interval_minutes"]))*60)
 
+    def _run_backup_cycle(self) -> None:
+        """MIS-95: one auto backup + retention rotation, with run status."""
+        backup=self.config["backup"]
+        path=self.store.backup_now("auto")
+        rotated=self.store.cleanup_auto_backups(int(backup["retention_hours"]))
+        interval=max(1,int(backup["interval_hours"]))*3600
+        self._backup_state.update({"last_run":time.time(),"last_success":True,"last_error":None,
+                                   "last_file":path.name,"rotated":rotated,"next_run":time.time()+interval})
+
+    async def _backup_loop(self):
+        while True:
+            try:
+                self._run_backup_cycle()
+            except asyncio.CancelledError: raise
+            except Exception as exc:
+                self._backup_state.update({"last_run":time.time(),"last_success":False,"last_error":str(exc)[:120]})
+                logger.exception("[关系弧线] backup scheduler failed; retrying")
+            await asyncio.sleep(max(1,int(self.config["backup"]["interval_hours"]))*3600)
+
+    def _create_full_backup(self, kind: str) -> Path:
+        """MIS-95: SQLite snapshot plus config copy plus a verifiable manifest
+        (schema/config versions, integrity check, sha256 of both files)."""
+        import hashlib
+        import shutil
+        import sqlite3
+        sqlite_path=self.store.backup_now(kind)
+        stem=sqlite_path.stem
+        config_dst=sqlite_path.with_name(stem+".config.json")
+        shutil.copy2(self.config_mgr.path, config_dst)
+        check=sqlite3.connect(sqlite_path)
+        try:
+            integrity=check.execute("PRAGMA integrity_check").fetchone()[0]
+            schema_version=int(check.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            check.close()
+        def digest(file: Path) -> str:
+            return hashlib.sha256(file.read_bytes()).hexdigest()
+        manifest={"created_at":time.time(),"schema_version":schema_version,
+                  "config_version":self.config["config_version"],"integrity":integrity,
+                  "sha256":{"sqlite":digest(sqlite_path),"config":digest(config_dst)}}
+        sqlite_path.with_name(stem+".manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=1),encoding="utf-8")
+        return sqlite_path
+
     async def _restart_decay_scheduler(self):
-        if self._decay_task:
-            self._decay_task.cancel()
-            try: await self._decay_task
-            except asyncio.CancelledError: pass
-            self._decay_task=None
+        await self._restart_schedulers()
+
+    async def _restart_schedulers(self):
+        # MIS-95: decay and backup tasks share one managed restart path so a
+        # Pages config save can never leave a duplicate task behind.
+        for task_name in ("_decay_task", "_backup_task"):
+            task = getattr(self, task_name)
+            if task:
+                task.cancel()
+                try: await task
+                except asyncio.CancelledError: pass
+                setattr(self, task_name, None)
         if self.config.get("decay",{}).get("enabled"):
-            self._decay_task=asyncio.create_task(self._decay_loop(),name="relation-arc-decay")
+            self._decay_task=self._spawn(self._decay_loop(),"relation-arc-decay")
+        if self.config.get("backup",{}).get("enabled"):
+            self._backup_task=self._spawn(self._backup_loop(),"relation-arc-backup")
 
     async def terminate(self):
-        if self._decay_task:
-            self._decay_task.cancel()
-            try: await self._decay_task
-            except asyncio.CancelledError: pass
-            self._decay_task=None
+        for task_name in ("_decay_task", "_backup_task"):
+            task = getattr(self, task_name)
+            if task:
+                task.cancel()
+                try: await task
+                except asyncio.CancelledError: pass
+                setattr(self, task_name, None)
         self.store.close()
         logger.info("[关系弧线] 已清理运行时资源。")
 
@@ -902,7 +968,7 @@ class RelationArc(Star):
     async def _api_backups(self):
         from quart import request, jsonify
         if request.method == "GET":
-            return jsonify({"backups": self.store.list_backups(), "retention_hours": self.config.get("backup", {}).get("retention_hours", 168)})
+            return jsonify({"backups": self.store.list_backups(), "retention_hours": self.config.get("backup", {}).get("retention_hours", 168), "scheduler": dict(self._backup_state)})
         payload = await request.get_json()
         if not isinstance(payload, dict) or payload.get("action") != "backup_now":
             return jsonify({"error": "仅支持 backup_now"}), 400
