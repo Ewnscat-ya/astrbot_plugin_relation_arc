@@ -288,15 +288,79 @@ class RelationStore:
         where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
         with self.lock, self._connection() as conn: return int(conn.execute("SELECT count(*) FROM accounts"+where,params).fetchone()[0])
 
-    def list_accounts_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None) -> list[dict[str, Any]]:
-        page=max(1,int(page)); page_size=max(1,min(int(page_size),100)); clauses=[];params=[]
-        if scope_kind in {"global","session"}: clauses.append("scope_kind=?");params.append(scope_kind)
-        if scope_id is not None: clauses.append("scope_id=?");params.append(scope_id)
-        where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
-        params.extend((page_size,(page-1)*page_size))
+    MAX_PAGE_SIZE = 200
+
+    def _scope_admission(self, scope_allowed, table: str) -> tuple[int, str]:
+        """MIS-98: bound-parameter scope admission for the universal paginated
+        queries. Returns (global_flag, admitted_session_ids_json). Session ids
+        are enumerated from live data and passed as one bound JSON array
+        consumed by json_each; the table choice is a literal branch."""
+        global_flag = 1 if scope_allowed("global", "") else 0
+        with self._connection() as conn:
+            if table == "accounts":
+                ids = [r["scope_id"] for r in conn.execute("SELECT DISTINCT scope_id FROM accounts WHERE scope_kind='session'")]
+            elif table == "events":
+                ids = [r["scope_id"] for r in conn.execute("SELECT DISTINCT scope_id FROM events WHERE scope_kind='session'")]
+            elif table == "relationship_bindings":
+                ids = [r["scope_id"] for r in conn.execute("SELECT DISTINCT scope_id FROM relationship_bindings WHERE scope_kind='session'")]
+            else:
+                raise ValueError("unknown table")
+        keep = [sid for sid in ids if scope_allowed("session", sid)]
+        return global_flag, json.dumps(keep)
+
+    def list_accounts_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
+        """MIS-98: server-side pagination behind one single-line literal query.
+        Optional filters bind as (? IS NULL OR col=?) pairs; scope admission
+        rides on a bound global flag plus a bound json_each array, so no SQL
+        text is ever constructed from runtime values."""
+        page=max(1,int(page)); page_size=max(1,min(int(page_size),self.MAX_PAGE_SIZE))
+        scope_allowed = scope_allowed or (lambda kind, sid: True)
+        global_flag, session_ids = self._scope_admission(scope_allowed, "accounts")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, page_size, (page-1)*page_size]
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT identity,scope_kind,scope_id,values_json,state_json,paused,revision,updated_at FROM accounts"+where+" ORDER BY updated_at DESC LIMIT ? OFFSET ?",params).fetchall()
+            rows=conn.execute("SELECT identity,scope_kind,scope_id,values_json,state_json,paused,revision,updated_at FROM accounts WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY updated_at DESC, identity ASC, scope_kind ASC, scope_id ASC LIMIT ? OFFSET ?",params).fetchall()
             return [{**dict(row),**self._row_account(row)} for row in rows]
+
+    def count_accounts_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> int:
+        global_flag, session_ids = self._scope_admission(scope_allowed, "accounts")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id]
+        with self.lock, self._connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM accounts WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
+
+    def list_bindings_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None, status: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
+        """MIS-98: server-side binding pagination behind one single-line
+        literal query; optional filters bind as (? IS NULL OR col=?) pairs."""
+        page=max(1,int(page)); page_size=max(1,min(int(page_size),self.MAX_PAGE_SIZE))
+        scope_allowed = scope_allowed or (lambda kind, sid: True)
+        global_flag, session_ids = self._scope_admission(scope_allowed, "relationship_bindings")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, status, status, page_size, (page-1)*page_size]
+        with self.lock, self._connection() as conn:
+            rows=conn.execute("SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at FROM relationship_bindings WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?) ORDER BY updated_at DESC, binding_id ASC LIMIT ? OFFSET ?",params).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_bindings_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, status: str | None = None, scope_allowed=None) -> int:
+        scope_allowed = scope_allowed or (lambda kind, sid: True)
+        global_flag, session_ids = self._scope_admission(scope_allowed, "relationship_bindings")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, status, status]
+        with self.lock, self._connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM relationship_bindings WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?)",params).fetchone()[0])
+
+    def list_events_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
+        """MIS-98: audit event pagination behind one single-line literal query."""
+        page=max(1,int(page)); page_size=max(1,min(int(page_size),self.MAX_PAGE_SIZE))
+        scope_allowed = scope_allowed or (lambda kind, sid: True)
+        global_flag, session_ids = self._scope_admission(scope_allowed, "events")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, page_size, (page-1)*page_size]
+        with self.lock, self._connection() as conn:
+            rows=conn.execute("SELECT event_id,identity,scope_kind,scope_id,source_kind,reason,requested_json,applied_json,notes_json,actor,created_at FROM events WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY created_at DESC, event_id ASC LIMIT ? OFFSET ?",params).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_events_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> int:
+        scope_allowed = scope_allowed or (lambda kind, sid: True)
+        global_flag, session_ids = self._scope_admission(scope_allowed, "events")
+        params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id]
+        with self.lock, self._connection() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM events WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
 
     def list_accounts(self, limit: int = 200, scope_kind: str | None = None) -> list[dict[str, Any]]:
         with self.lock, self._connection() as conn:
@@ -569,14 +633,22 @@ class RelationStore:
             query += " ORDER BY created_at DESC LIMIT ?"
             return [dict(row) for row in conn.execute(query, (*args, max(1, min(limit, 500))))]
 
+    @staticmethod
+    def audit_cards_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """MIS-98: card projection for already-paginated event rows."""
+        cards=[]
+        for row in rows:
+            try: requested, applied, notes = json.loads(row["requested_json"]), json.loads(row["applied_json"]), json.loads(row["notes_json"])
+            except json.JSONDecodeError: requested, applied, notes = {}, {}, {}
+            cards.append({"event_id":row["event_id"],"scope_kind":row["scope_kind"],"source_kind":row["source_kind"],"actor":row["actor"],"created_at":row["created_at"],"requested":{k:int(v) for k,v in requested.items() if v},"applied":{k:int(v) for k,v in applied.items() if v},"policy":{k:v.get("notes",[]) for k,v in notes.items() if isinstance(v,dict) and v.get("notes")}})
+        return cards
+
     def audit_cards(self, limit: int = 200, scope_kind: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
         cards=[]
         for row in self.list_events(limit, scope_kind):
             if scope_allowed is not None and not scope_allowed(row["scope_kind"], row["scope_id"]):
                 continue
-            try: requested, applied, notes = json.loads(row["requested_json"]), json.loads(row["applied_json"]), json.loads(row["notes_json"])
-            except json.JSONDecodeError: requested, applied, notes = {}, {}, {}
-            cards.append({"event_id":row["event_id"],"scope_kind":row["scope_kind"],"source_kind":row["source_kind"],"actor":row["actor"],"created_at":row["created_at"],"requested":{k:int(v) for k,v in requested.items() if v},"applied":{k:int(v) for k,v in applied.items() if v},"policy":{k:v.get("notes",[]) for k,v in notes.items() if isinstance(v,dict) and v.get("notes")}})
+            cards.extend(self.audit_cards_from_rows([row]))
         return cards
 
     def record_protocol_health(self, outcome: str, source: str, bare_recovery: bool, effect_count: int, retention_days: int) -> None:
@@ -593,12 +665,20 @@ class RelationStore:
 
     def list_bindings(self, limit: int = 200, scope_kind: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         """B0 management query. No write method exists until B2 validation ships."""
-        clauses=[]; args: list[Any]=[]
-        if scope_kind in {"global", "session"}: clauses.append("scope_kind=?"); args.append(scope_kind)
-        if status in {"active", "ended"}: clauses.append("status=?"); args.append(status)
-        query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings"
-        if clauses: query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY updated_at DESC LIMIT ?"; args.append(max(1,min(limit,500)))
+        # Fully literal branch queries: every clause is a compile-time constant.
+        if scope_kind in {"global", "session"} and status in {"active", "ended"}:
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE scope_kind=? AND status=? ORDER BY updated_at DESC LIMIT ?"
+            args: list[Any]=[scope_kind,status]
+        elif scope_kind in {"global", "session"}:
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE scope_kind=? ORDER BY updated_at DESC LIMIT ?"
+            args=[scope_kind]
+        elif status in {"active", "ended"}:
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE status=? ORDER BY updated_at DESC LIMIT ?"
+            args=[status]
+        else:
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings ORDER BY updated_at DESC LIMIT ?"
+            args=[]
+        args.append(max(1,min(limit,500)))
         with self.lock, self._connection() as conn:
             return [dict(row) for row in conn.execute(query,tuple(args)).fetchall()]
 

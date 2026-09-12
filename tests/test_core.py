@@ -904,5 +904,91 @@ class WindowMergeEquivalenceTests(unittest.TestCase):
             self.assertEqual(4, store._window_positive_total(window, now - 60, "trust"))
 
 
+class ServerPaginationTests(unittest.TestCase):
+    """MIS-98: bounded server-side pagination with exact totals and stable order."""
+
+    def _seed_accounts(self, store, count, scope_id=""):
+        scope_kind = "global" if scope_id == "" else "session"
+        for index in range(count):
+            store.account(f"qq:p-{index:05d}", scope_kind, scope_id)
+            store.set_dimension(f"qq:p-{index:05d}", scope_kind, scope_id, "trust", 400 + (index % 3))
+
+    def test_thousand_accounts_all_pages_reachable_and_total_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed_accounts(store, 1001)
+            self.assertEqual(1001, store.count_accounts_page(scope_allowed=lambda *a: True))
+            seen = []
+            page = 1
+            while True:
+                rows = store.list_accounts_page(page=page, page_size=100, scope_allowed=lambda *a: True)
+                seen.extend(row["identity"] for row in rows)
+                if not rows: break
+                if len(rows) < 100: break
+                page += 1
+            self.assertEqual(1001, len(seen))
+            self.assertEqual(len(set(seen)), len(seen))
+
+    def test_stable_order_for_equal_updated_at(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed_accounts(store, 50)
+            first = [row["identity"] for row in store.list_accounts_page(page=1, page_size=100, scope_allowed=lambda *a: True)]
+            second = [row["identity"] for row in store.list_accounts_page(page=1, page_size=100, scope_allowed=lambda *a: True)]
+            self.assertEqual(first, second)
+
+    def test_page_size_clamped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed_accounts(store, 10)
+            self.assertLessEqual(len(store.list_accounts_page(page=1, page_size=500, scope_allowed=lambda *a: True)), store.MAX_PAGE_SIZE)
+            # page=0 clamps to page 1 (bounded parameter semantics).
+            self.assertEqual(10, len(store.list_accounts_page(page=0, page_size=20, scope_allowed=lambda *a: True)))
+
+    def test_bindings_and_events_paged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            for index in range(60):
+                identity = f"qq:b-{index:03d}"
+                store.apply_turn_with_binding(
+                    event_id=f"bp-{index}", identity=identity, scope_kind="global", scope_id="",
+                    source_kind="private", evidence="", reason="", requested={}, applied={},
+                    notes={}, binding={"binding_id": f"bid-{index}", "type_key": "friend",
+                                       "unique_scope": "", "origin": "t", "summary": ""})
+            store.apply(event_id=f"bp-ev", identity="qq:b-000", scope_kind="global", scope_id="",
+                        source_kind="private", evidence="e", reason="r",
+                        requested={"trust": 1}, applied={"trust": 1}, notes={}, actor="llm")
+            self.assertEqual(60, store.count_bindings_page(scope_allowed=lambda *a: True))
+            rows = store.list_bindings_page(page=2, page_size=50, scope_allowed=lambda *a: True)
+            self.assertEqual(10, len(rows))
+            # 60 binding-created events + 1 explicit llm event exist globally.
+            self.assertGreaterEqual(store.count_events_page(scope_allowed=lambda *a: True), 61)
+            self.assertEqual(50, len(store.list_events_page(page=1, page_size=50, scope_allowed=lambda *a: True)))
+            # 60 binding settlements + 1 explicit llm event = 61; page 2 holds the remainder.
+            self.assertEqual(11, len(store.list_events_page(page=2, page_size=50, scope_allowed=lambda *a: True)))
+
+    def test_binding_counts_reflect_scope_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            policy = self._friend_policy() if hasattr(self, "_friend_policy") else None
+            del policy
+            for user in ("a", "b"):
+                store.account(f"qq:{user}", "session", "friend:1")
+                store.account(f"qq:{user}-x", "session", "blocked:9")
+            store.apply_turn_with_binding(
+                event_id="v1", identity="qq:a", scope_kind="session", scope_id="friend:1",
+                source_kind="private", evidence="", reason="", requested={}, applied={},
+                notes={}, binding={"binding_id": "vb1", "type_key": "friend", "unique_scope": "",
+                                   "origin": "t", "summary": ""})
+            store.apply_turn_with_binding(
+                event_id="v2", identity="qq:b-x", scope_kind="session", scope_id="blocked:9",
+                source_kind="group", evidence="", reason="", requested={}, applied={},
+                notes={}, binding={"binding_id": "vb2", "type_key": "friend", "unique_scope": "",
+                                   "origin": "t", "summary": ""})
+            allowed = lambda kind, sid: sid != "blocked:9"
+            self.assertEqual(1, store.count_bindings_page(scope_allowed=allowed))
+            self.assertEqual(1, len(store.list_bindings_page(page=1, page_size=50, scope_allowed=allowed)))
+
+
 if __name__ == '__main__':
     unittest.main()

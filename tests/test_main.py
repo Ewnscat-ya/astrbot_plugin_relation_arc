@@ -479,7 +479,7 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
     async def test_b3_pages_binding_manager_contract(self):
         root=Path(__file__).resolve().parents[1] / "pages" / "settings"
         text=(root / "index.html").read_text(encoding="utf-8")+(root / "app.js").read_text(encoding="utf-8")
-        for marker in ('data-tab="bindings"', "apiGet('bindings'", "apiPost('bindings'", 'data-end-binding', 'renderBindings'):
+        for marker in ('data-tab="bindings"', "apiGet('bindings?", "apiPost('bindings'", 'data-end-binding', 'renderBindings'):
             self.assertIn(marker, text)
 
     async def test_c4_blacklisted_settlement_does_not_mutate_or_pollute_health(self):

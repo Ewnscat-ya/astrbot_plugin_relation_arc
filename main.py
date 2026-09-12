@@ -549,25 +549,17 @@ class RelationArc(Star):
         # Same canonical/display(ID) resolver as management, but no writes.
         return self._target_identity(event, target, scope_kind, scope_id)
 
-    def _visible_accounts(self, scope_kind: str | None = None, scope_id: str | None = None) -> list[dict]:
-        """Accounts the requesting surface may see: excluded scopes are filtered
-        before pagination and totals, never after."""
-        page_size = 100
-        page = 1
-        visible: list[dict] = []
-        while True:
-            rows = self.store.list_accounts_page(page=page, page_size=page_size, scope_kind=scope_kind, scope_id=scope_id)
-            visible.extend(item for item in rows if self._stored_scope_allowed(item["scope_kind"], item["scope_id"]))
-            if len(rows) < page_size:
-                break
-            page += 1
-        return visible
 
     def _query_page(self, *, page: int, title: str, scope_kind: str | None = None, scope_id: str | None = None) -> str:
-        accounts = self._visible_accounts(scope_kind, scope_id)
-        size = 20; total = len(accounts); pages = max(1, (total + size - 1) // size); page = max(1, min(int(page), pages))
+        # MIS-98: totals and pages come from server-side filtered COUNT, so
+        # excluded scopes cannot shift pages or totals.
+        size = 20
+        total = self.store.count_accounts_page(scope_kind=scope_kind, scope_id=scope_id, scope_allowed=self._stored_scope_allowed)
+        pages = max(1, (total + size - 1) // size)
+        page = max(1, min(int(page), pages))
+        accounts = self.store.list_accounts_page(page=page, page_size=size, scope_kind=scope_kind, scope_id=scope_id, scope_allowed=self._stored_scope_allowed)
         rows = []
-        for item in accounts[(page - 1) * size:page * size]:
+        for item in accounts:
             label = item["identity"].rsplit(":", 1)[-1]; public = {k: item["values"].get(k, 0) / 10 for k in PUBLIC_DIMENSIONS}
             binding = ",".join(get_type(x["type_key"]).label for x in self.store.active_bindings_for(item["identity"], item["scope_kind"], item["scope_id"]) if get_type(x["type_key"])) or "无"
             rows.append(f"- {label} | {item['scope_kind']} | 信赖 {public['trust']:.1f} 认可 {public['respect']:.1f} 安心 {public['comfort']:.1f} 亲近 {public['closeness']:.1f} 共鸣 {public['resonance']:.1f} | 正式关系 {binding}")
@@ -936,29 +928,50 @@ class RelationArc(Star):
             return jsonify({"success":True,"account":account})
         scope_filter=request.args.get("scope")
         if scope_filter not in {"global","session"}: scope_filter=None
-        accounts=[{key:item[key] for key in ("identity","scope_kind","scope_id","values","state","paused","revision","updated_at")} for item in self.store.list_accounts(scope_kind=scope_filter) if self._stored_scope_allowed(item["scope_kind"],item["scope_id"])]
-        return jsonify({"accounts":accounts})
+        # MIS-98: server-side pagination and filtering; totals come from COUNT
+        # with the same admission policy, never from a truncated list.
+        try: page=max(1,int(request.args.get("page", 1)))
+        except ValueError: page=1
+        try: page_size=max(1,min(int(request.args.get("page_size", 50)), self.store.MAX_PAGE_SIZE))
+        except ValueError: return jsonify({"error":"page_size 必须是整数"}),400
+        total=self.store.count_accounts_page(scope_kind=scope_filter, scope_allowed=self._stored_scope_allowed)
+        accounts=[{key:item[key] for key in ("identity","scope_kind","scope_id","values","state","paused","revision","updated_at")} for item in self.store.list_accounts_page(page=page,page_size=page_size,scope_kind=scope_filter,scope_allowed=self._stored_scope_allowed)]
+        return jsonify({"accounts":accounts,"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size)})
 
     async def _api_audit(self):
         from quart import request, jsonify
-        scope_filter = request.args.get("scope")
-        if scope_filter not in {"global", "session"}:
-            scope_filter = None
+        scope_filter=request.args.get("scope")
+        if scope_filter not in {"global","session"}: scope_filter=None
         # Event cards deliberately omit identity, evidence, reason and raw notes;
-        # MIS-93: excluded scopes are filtered out before any card is built.
-        cards = self.store.audit_cards(scope_kind=scope_filter, scope_allowed=self._stored_scope_allowed)
-        return jsonify({"cards": cards})
+        # MIS-93/98: excluded scopes are filtered server-side before pagination.
+        try: page=max(1,int(request.args.get("page", 1)))
+        except ValueError: page=1
+        try: page_size=max(1,min(int(request.args.get("page_size", 100)), self.store.MAX_PAGE_SIZE))
+        except ValueError: return jsonify({"error":"page_size 必须是整数"}),400
+        total=self.store.count_events_page(scope_kind=scope_filter, scope_allowed=self._stored_scope_allowed)
+        rows=self.store.list_events_page(page=page,page_size=page_size,scope_kind=scope_filter,scope_allowed=self._stored_scope_allowed)
+        cards=self.store.audit_cards_from_rows(rows)
+        return jsonify({"cards":cards,"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size)})
 
     async def _api_overview(self):
         from quart import jsonify
-        accounts = [item for item in self.store.list_accounts(limit=500) if self._stored_scope_allowed(item["scope_kind"],item["scope_id"])]
-        bindings = [item for item in self.store.list_bindings(limit=500) if self._stored_scope_allowed(item["scope_kind"],item["scope_id"])]
-        binding_summary = {"total": len(bindings),
-                           "active": sum(item["status"] == "active" for item in bindings),
-                           "ended": sum(item["status"] == "ended" for item in bindings),
-                           "global": sum(item["scope_kind"] == "global" for item in bindings),
-                           "session": sum(item["scope_kind"] == "session" for item in bindings)}
-        return jsonify({"schema_version": 10, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": len(accounts), "global": sum(item["scope_kind"] == "global" for item in accounts), "session": sum(item["scope_kind"] == "session" for item in accounts)}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
+        # MIS-98: overview totals come from COUNT queries, never from
+        # truncated lists; exclusion filtering rides the same admission.
+        scope_allowed = self._stored_scope_allowed
+        account_total = self.store.count_accounts_page(scope_allowed=scope_allowed)
+        account_global = self.store.count_accounts_page(scope_kind="global", scope_allowed=scope_allowed)
+        account_session = self.store.count_accounts_page(scope_kind="session", scope_allowed=scope_allowed)
+        binding_total = self.store.count_bindings_page(scope_allowed=scope_allowed)
+        binding_active = self.store.count_bindings_page(status="active", scope_allowed=scope_allowed)
+        binding_ended = self.store.count_bindings_page(status="ended", scope_allowed=scope_allowed)
+        binding_global = self.store.count_bindings_page(scope_kind="global", scope_allowed=scope_allowed)
+        binding_session = self.store.count_bindings_page(scope_kind="session", scope_allowed=scope_allowed)
+        binding_summary = {"total": binding_total,
+                           "active": binding_active,
+                           "ended": binding_ended,
+                           "global": binding_global,
+                           "session": binding_session}
+        return jsonify({"schema_version": 11, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": account_total, "global": account_global, "session": account_session}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
 
     async def _api_health(self):
         from quart import jsonify
@@ -979,13 +992,17 @@ class RelationArc(Star):
         if scope_filter not in {"global","session"}: scope_filter=None
         status=request.args.get("status")
         if status not in {"active","ended"}: status=None
+        # MIS-98: server-side pagination and filtering for bindings.
+        try: page=max(1,int(request.args.get("page", 1)))
+        except ValueError: page=1
+        try: page_size=max(1,min(int(request.args.get("page_size", 100)), self.store.MAX_PAGE_SIZE))
+        except ValueError: return jsonify({"error":"page_size 必须是整数"}),400
+        total=self.store.count_bindings_page(scope_kind=scope_filter,status=status,scope_allowed=self._stored_scope_allowed)
         bindings=[]
-        for item in self.store.list_bindings(scope_kind=scope_filter,status=status):
-            if not self._stored_scope_allowed(item["scope_kind"],item["scope_id"]):
-                continue
+        for item in self.store.list_bindings_page(page=page,page_size=page_size,scope_kind=scope_filter,status=status,scope_allowed=self._stored_scope_allowed):
             relationship_type=get_type(item["type_key"])
             bindings.append({**item,"label":relationship_type.label if relationship_type else item["type_key"]})
-        return jsonify({"bindings":bindings,"directory":public_directory()})
+        return jsonify({"bindings":bindings,"directory":public_directory(),"page":page,"page_size":page_size,"total":total,"pages":max(1,(total+page_size-1)//page_size)})
 
     async def _api_migrations(self):
         from quart import jsonify
