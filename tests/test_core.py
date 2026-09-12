@@ -337,7 +337,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
             store.account("qq:keep", "global", "")
             db_path = Path(directory) / "relation_arc.sqlite3"
             raw = sqlite3.connect(db_path)
-            raw.execute("PRAGMA user_version=11")
+            raw.execute("PRAGMA user_version=12")
             raw.commit()
             raw.close()
             with self.assertRaises(ValueError) as ctx:
@@ -347,7 +347,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
             version = check.execute("PRAGMA user_version").fetchone()[0]
             kept = check.execute("SELECT identity FROM accounts WHERE identity='qq:keep'").fetchone()
             check.close()
-            self.assertEqual(11, version)
+            self.assertEqual(12, version)
             self.assertIsNotNone(kept)
 
     def test_corrupt_database_refused_and_preserved(self):
@@ -743,7 +743,7 @@ class BackupRestoreTests(unittest.TestCase):
                     raw.close()
                     backup_file.write_bytes(b"junk" * 512)
                 elif case == "future":
-                    raw.execute("PRAGMA user_version=11")
+                    raw.execute("PRAGMA user_version=12")
                     raw.commit(); raw.close()
                 else:
                     raw.execute("PRAGMA user_version=0")
@@ -792,6 +792,52 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertEqual(before_revision, after["revision"])
             # The pre-restore snapshot exists for manual recovery.
             self.assertTrue(any(item["kind"] == "pre_restore" for item in store.list_backups()))
+
+
+class DecayPeriodTests(unittest.TestCase):
+    """MIS-96: one decay per persisted period; floors and timestamps intact."""
+
+    def _decay_kwargs(self, floors=None):
+        return {"floors": floors or {key: 0 for key in DEFAULT_VALUES}, "step": 5,
+                "inactive_before": time.time() + 1,
+                "scope_allowed": lambda *_: True}
+
+    def _seed_account(self, store, identity="qq:decay", trust=400, last_interaction=None):
+        store.account(identity, "global", "")
+        store.set_dimension(identity, "global", "", "trust", trust)
+        if last_interaction is not None:
+            import sqlite3
+            raw = sqlite3.connect(store.path)
+            raw.execute("UPDATE accounts SET last_interaction=? WHERE identity=?", (last_interaction, identity))
+            raw.commit(); raw.close()
+
+    def test_decay_if_due_runs_once_per_period(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed_account(store, last_interaction=time.time() - 10 * 3600)
+            kwargs = self._decay_kwargs()
+            self.assertTrue(store.decay_if_due(interval_seconds=1800, **kwargs))
+            self.assertEqual(395, store.existing_account("qq:decay", "global", "")["values"]["trust"])
+            self.assertFalse(store.decay_if_due(interval_seconds=1800, **kwargs))
+            self.assertFalse(store.decay_if_due(interval_seconds=1800, **kwargs))
+            self.assertEqual(395, store.existing_account("qq:decay", "global", "")["values"]["trust"])
+            self.assertEqual(1, store.get_scheduler_state("decay_last_run") is not None and
+                             sum(1 for row in store.recent("qq:decay", "global", "", 50)
+                                 if row["actor"] == "scheduler"))
+
+    def test_below_floor_never_raised_and_timestamps_not_forged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            self._seed_account(store, trust=3, last_interaction=12345.0)
+            floors = {key: 0 for key in DEFAULT_VALUES}
+            floors["trust"] = 10
+            store.decay_accounts(**self._decay_kwargs(floors=floors))
+            account = store.existing_account("qq:decay", "global", "")
+            self.assertEqual(3, account["values"]["trust"])
+            self.assertEqual(12345.0, account["last_interaction"])
+            store.set_dimension("qq:decay", "global", "", "trust", 300)
+            store.adjust_dimension("qq:decay", "global", "", "trust", 5)
+            self.assertEqual(12345.0, store.existing_account("qq:decay", "global", "")["last_interaction"])
 
 
 if __name__ == '__main__':

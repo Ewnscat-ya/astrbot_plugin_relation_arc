@@ -936,14 +936,19 @@ class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.terminate()
         self.temp.cleanup()
 
-    async def test_backup_task_single_instance_across_restarts(self):
+    async def test_backup_task_kept_on_unrelated_save_replaced_on_change(self):
+        # MIS-96: an unrelated save keeps the running task and its timing.
         first = self.plugin._backup_task
         self.assertIsNotNone(first)
+        self.plugin.config["raw_delta_limit"] = 8
         await self.plugin._restart_schedulers()
-        self.assertIsNotNone(self.plugin._backup_task)
+        self.assertIs(first, self.plugin._backup_task)
+        self.assertFalse(first.cancelled() or first.done())
+        # A backup-relevant change replaces the task exactly once.
+        self.plugin.config["backup"]["interval_hours"] = 12
+        await self.plugin._restart_schedulers()
         self.assertIsNot(first, self.plugin._backup_task)
         self.assertTrue(first.cancelled() or first.done())
-        self.assertIs(self.plugin._decay_task, self.plugin._decay_task)
 
     async def test_disabled_backup_creates_no_task(self):
         self.plugin.config["backup"]["enabled"] = False
@@ -976,7 +981,7 @@ class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manifest_path.is_file())
         manifest = jsonlib.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual("ok", manifest["integrity"])
-        self.assertEqual(10, manifest["schema_version"])
+        self.assertEqual(11, manifest["schema_version"])
         self.assertEqual(6, manifest["config_version"])
 
     async def test_backups_api_surfaces_scheduler_state(self):

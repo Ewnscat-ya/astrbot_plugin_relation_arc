@@ -43,6 +43,8 @@ class RelationArc(Star):
         self.store = RelationStore(data_root / "plugin_data" / PLUGIN_NAME, self.config)
         self._decay_task: asyncio.Task | None = None
         self._backup_task: asyncio.Task | None = None
+        self._decay_sig: str | None = None
+        self._backup_sig: str | None = None
         self._backup_state: dict[str, Any] = {}
         self._repair_legacy_identity_splits()
         self._migrate_confirmed_legacy_binding()
@@ -52,6 +54,8 @@ class RelationArc(Star):
             self._decay_task=self._spawn(self._decay_loop(),"relation-arc-decay")
         if self.config.get("backup",{}).get("enabled"):
             self._backup_task=self._spawn(self._backup_loop(),"relation-arc-backup")
+        self._decay_sig=self._decay_signature()
+        self._backup_sig=self._backup_signature()
 
     def _spawn(self, coro, name: str):
         """Create a managed task when a loop is running; sync embedding (tests,
@@ -783,12 +787,29 @@ class RelationArc(Star):
     async def _decay_loop(self):
         while True:
             try:
+                interval=max(1,int(self.config["decay"]["interval_minutes"]))*60
+                last=self.store.get_scheduler_state("decay_last_run")
+                now=time.time()
+                wait=0.0 if last is None or now-float(last)>=interval else interval-(now-float(last))
+                if wait>0:
+                    await asyncio.sleep(wait)
                 decay=self.config["decay"]
-                self.store.decay_accounts(floors=decay["floors"],step=decay["step"],inactive_before=time.time()-decay["inactive_hours"]*3600,scope_allowed=self._stored_scope_allowed)
+                # Persisted due-check + marker share the decay transaction, so a
+                # restart can never apply the same period twice (MIS-96).
+                self.store.decay_if_due(floors=decay["floors"],step=decay["step"],
+                                        inactive_before=time.time()-decay["inactive_hours"]*3600,
+                                        scope_allowed=self._stored_scope_allowed,
+                                        interval_seconds=interval)
             except asyncio.CancelledError: raise
             except Exception:
                 logger.exception("[关系弧线] decay scheduler failed; retrying")
-            await asyncio.sleep(max(1,int(self.config["decay"]["interval_minutes"]))*60)
+            await asyncio.sleep(1)
+
+    def _decay_signature(self) -> str:
+        return json.dumps(self.config.get("decay", {}), sort_keys=True)
+
+    def _backup_signature(self) -> str:
+        return json.dumps(self.config.get("backup", {}), sort_keys=True)
 
     def _run_backup_cycle(self) -> None:
         """MIS-95: one auto backup + retention rotation, with run status."""
@@ -837,18 +858,23 @@ class RelationArc(Star):
         await self._restart_schedulers()
 
     async def _restart_schedulers(self):
-        # MIS-95: decay and backup tasks share one managed restart path so a
-        # Pages config save can never leave a duplicate task behind.
-        for task_name in ("_decay_task", "_backup_task"):
+        # MIS-96: signature-aware restart - unrelated config saves keep the
+        # running tasks and their period timing untouched.
+        for task_name, sig_attr, signer in (("_decay_task", "_decay_sig", self._decay_signature),
+                                            ("_backup_task", "_backup_sig", self._backup_signature)):
+            signature = signer()
+            if getattr(self, sig_attr, None) == signature and getattr(self, task_name) is not None:
+                continue
             task = getattr(self, task_name)
             if task:
                 task.cancel()
                 try: await task
                 except asyncio.CancelledError: pass
                 setattr(self, task_name, None)
-        if self.config.get("decay",{}).get("enabled"):
+            setattr(self, sig_attr, signature)
+        if self.config.get("decay",{}).get("enabled") and self._decay_task is None:
             self._decay_task=self._spawn(self._decay_loop(),"relation-arc-decay")
-        if self.config.get("backup",{}).get("enabled"):
+        if self.config.get("backup",{}).get("enabled") and self._backup_task is None:
             self._backup_task=self._spawn(self._backup_loop(),"relation-arc-backup")
 
     async def terminate(self):

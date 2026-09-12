@@ -12,7 +12,7 @@ from typing import Any
 
 from .relation_engine import DIMENSIONS, DEFAULT_VALUES, apply_delta, clamp
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 BACKUP_KINDS = {"auto", "manual", "migration", "pre_restore"}
 SAFETY_RANK = {"normal": 0, "slow_down": 1, "pause_intimacy": 2}
 
@@ -107,6 +107,9 @@ class RelationStore:
             # B0: a separate ledger from accounts. It intentionally starts empty:
             # only B2's validated same-turn proposal chain may create a binding.
             conn.execute("CREATE TABLE IF NOT EXISTS relationship_bindings (binding_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','ended')), unique_scope TEXT NOT NULL DEFAULT '', origin_event_id TEXT NOT NULL DEFAULT '', state_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL, ended_at REAL)")
+            # MIS-96: persisted scheduler period markers (decay_last_run), so a
+            # restart or duplicate start can never apply the same period twice.
+            conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
@@ -121,7 +124,7 @@ class RelationStore:
             # SQLite PRAGMA cannot bind parameters, so the version literal is
             # written directly and verified against SCHEMA_VERSION on read-back;
             # any drift fails loudly instead of silently mislabelling a database.
-            conn.execute("PRAGMA user_version=10")
+            conn.execute("PRAGMA user_version=11")
             written = conn.execute("PRAGMA user_version").fetchone()[0]
             if written != SCHEMA_VERSION:
                 raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")
@@ -709,21 +712,48 @@ class RelationStore:
 
     def decay_accounts(self, *, floors: dict[str,int], step: int, inactive_before: float, scope_allowed) -> int:
         """Floor-only decay. Administrative timestamps never affect this eligibility."""
+        with self.lock, self._connection() as conn:
+            return self._decay_accounts_conn(conn, floors=floors, step=step,
+                                             inactive_before=inactive_before, scope_allowed=scope_allowed)
+
+    def get_scheduler_state(self, key: str) -> float | None:
+        with self.lock, self._connection() as conn:
+            row = conn.execute("SELECT value FROM scheduler_state WHERE key=?", (key,)).fetchone()
+            return float(row["value"]) if row else None
+
+    def decay_if_due(self, *, floors: dict[str,int], step: int, inactive_before: float, scope_allowed, interval_seconds: int, now: float | None = None) -> bool:
+        """MIS-96: apply decay only when the persisted period has elapsed.
+
+        The due check, the decay and the period marker update share one
+        transaction, so restarts or duplicate starts can never apply the same
+        period twice. Returns True when a decay actually ran."""
+        now = time.time() if now is None else float(now)
+        with self.lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value FROM scheduler_state WHERE key='decay_last_run'").fetchone()
+            if row is not None and now - float(row["value"]) < interval_seconds:
+                conn.execute("ROLLBACK")
+                return False
+            self._decay_accounts_conn(conn, floors=floors, step=step,
+                                      inactive_before=inactive_before, scope_allowed=scope_allowed)
+            conn.execute("INSERT INTO scheduler_state(key,value) VALUES('decay_last_run',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
+            return True
+
+    def _decay_accounts_conn(self, conn, *, floors: dict[str,int], step: int, inactive_before: float, scope_allowed) -> int:
         if set(floors)!=set(DIMENSIONS) or step<1: raise ValueError("invalid decay configuration")
         changed=0
-        with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT * FROM accounts WHERE last_interaction>0 AND last_interaction<=?",(inactive_before,)).fetchall()
-            for row in rows:
-                if not scope_allowed(row["scope_kind"],row["scope_id"]): continue
-                values={**DEFAULT_VALUES,**json.loads(row["values_json"])}
-                next_values={key:max(int(floors[key]),int(value)-step) if int(value)>int(floors[key]) else int(value) for key,value in values.items()}
-                if next_values==values: continue
-                now=time.time()
-                conn.execute("UPDATE accounts SET values_json=?,revision=revision+1,updated_at=? WHERE identity=? AND scope_kind=? AND scope_id=?",(json.dumps(next_values),now,row["identity"],row["scope_kind"],row["scope_id"]))
-                event_id=hashlib.sha256(f"decay:{row['identity']}:{row['scope_kind']}:{row['scope_id']}:{time.time_ns()}".encode()).hexdigest()[:32]
-                applied={key:next_values[key]-values[key] for key in DIMENSIONS if next_values[key]!=values[key]}
-                conn.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(event_id,row["identity"],row["scope_kind"],row["scope_id"],"decay","","inactivity_decay",json.dumps(applied),json.dumps(applied),json.dumps({"decay":True}),"scheduler",now))
-                changed+=1
+        rows=conn.execute("SELECT * FROM accounts WHERE last_interaction>0 AND last_interaction<=?",(inactive_before,)).fetchall()
+        for row in rows:
+            if not scope_allowed(row["scope_kind"],row["scope_id"]): continue
+            values={**DEFAULT_VALUES,**json.loads(row["values_json"])}
+            next_values={key:max(int(floors[key]),int(value)-step) if int(value)>int(floors[key]) else int(value) for key,value in values.items()}
+            if next_values==values: continue
+            now=time.time()
+            conn.execute("UPDATE accounts SET values_json=?,revision=revision+1,updated_at=? WHERE identity=? AND scope_kind=? AND scope_id=?",(json.dumps(next_values),now,row["identity"],row["scope_kind"],row["scope_id"]))
+            event_id=hashlib.sha256(f"decay:{row['identity']}:{row['scope_kind']}:{row['scope_id']}:{time.time_ns()}".encode()).hexdigest()[:32]
+            applied={key:next_values[key]-values[key] for key in DIMENSIONS if next_values[key]!=values[key]}
+            conn.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(event_id,row["identity"],row["scope_kind"],row["scope_id"],"decay","","inactivity_decay",json.dumps(applied),json.dumps(applied),json.dumps({"decay":True}),"scheduler",now))
+            changed+=1
         return changed
 
     def set_dimension(self, identity: str, scope_kind: str, scope_id: str, dimension: str, value: int, actor: str = "administrator") -> dict[str, int]:
