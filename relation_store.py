@@ -112,6 +112,11 @@ class RelationStore:
             conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
+            # MIS-97: settlement window scans and health retention filter by
+            # these columns on every turn; without them events degrade to a
+            # full table scan as data grows.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_window ON events(identity,scope_kind,scope_id,actor,created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_protocol_health_created ON protocol_health(created_at)")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
             if "state_json" not in columns:
                 conn.execute("ALTER TABLE accounts ADD COLUMN state_json TEXT NOT NULL DEFAULT '{}'")
@@ -408,6 +413,14 @@ class RelationStore:
             romance_allowed = bool(romance_gate(values, final_state))
             applied, notes = {}, {}
             anti_farm = policy.get("anti_farm", {})
+            # MIS-97: one window fetch shared by all dimensions. The repeat
+            # window (repeat_window_minutes) and the anti-farm window
+            # (rolling_window_hours) have different horizons, so rows carry
+            # created_at and each use re-filters by time — semantics identical
+            # to the previous per-dimension queries (equivalence-tested).
+            repeat_since = now - policy["repeat_window_minutes"] * 60
+            farm_since = now - int(anti_farm.get("rolling_window_hours", 24)) * 3600
+            window = self._window_rows(conn, identity, scope_kind, scope_id, min(repeat_since, farm_since))
             for dimension in DIMENSIONS:
                 requested = int(requested_all.get(dimension, 0))
                 if not requested:
@@ -417,11 +430,10 @@ class RelationStore:
                     notes[dimension] = {"requested": requested, "repeat_factor": 1.0, "notes": ("romance_locked",), "window_positive": 0}
                     applied[dimension] = 0
                     continue
-                repeat_count = self._repeat_count(conn, identity, scope_kind, scope_id, dimension, evidence, now - policy["repeat_window_minutes"] * 60, signature=fact_signature)
+                repeat_count = self._window_repeat_count(window, repeat_since, dimension, evidence, fact_signature)
                 result = apply_delta(values.get(dimension, 0), requested, repeat_count, policy["repeat_factors"], False)
                 ceiling = int(anti_farm.get("positive_change_ceiling", {}).get(dimension, 0))
-                since = now - int(anti_farm.get("rolling_window_hours", 24)) * 3600
-                already_positive = self._positive_window_total(conn, identity, scope_kind, scope_id, dimension, since)
+                already_positive = self._window_positive_total(window, farm_since, dimension)
                 applied_value = result.applied
                 result_notes = result.notes
                 if applied_value > 0 and ceiling > 0:
@@ -667,6 +679,36 @@ class RelationStore:
     def repeat_count(self, identity: str, scope_kind: str, scope_id: str, dimension: str, evidence: str, since: float, signature: str | None = None) -> int:
         with self.lock, self._connection() as conn:
             return self._repeat_count(conn, identity, scope_kind, scope_id, dimension, evidence, since, signature)
+
+    def _window_rows(self, conn, identity: str, scope_kind: str, scope_id: str, since: float) -> list[tuple[int, dict[str, Any], dict[str, Any], list[str]]]:
+        """MIS-97: one window fetch shared by every dimension in a turn.
+
+        Returns (created_at, applied, requested, evidence_parts) tuples. Each
+        llm event in the window is JSON-parsed exactly once here, instead of
+        once per dimension per query (up to 12 full window scans before). The
+        repeat window and the anti-farm window have different horizons, so the
+        timestamp is carried and each use re-filters by time."""
+        rows = conn.execute("SELECT applied_json,requested_json,evidence,created_at FROM events WHERE identity=? AND scope_kind=? AND scope_id=? AND created_at>=? AND actor='llm'", (identity, scope_kind, scope_id, since)).fetchall()
+        parsed=[]
+        for row in rows:
+            try:
+                applied=json.loads(row["applied_json"]); requested=json.loads(row["requested_json"])
+            except (ValueError,RecursionError):
+                continue
+            parsed.append((float(row["created_at"]), applied, requested, row["evidence"].split(" | ")))
+        return parsed
+
+    def _window_repeat_count(self, window, repeat_since: float, dimension: str, evidence: str, signature: str | None) -> int:
+        count=0
+        for created_at,applied,requested,evidences in window:
+            if created_at < repeat_since: continue
+            if dimension not in applied: continue
+            if evidence and evidence in evidences: count+=1
+            elif not evidence and signature and signature == self.effect_signature(requested): count+=1
+        return count
+
+    def _window_positive_total(self, window, farm_since: float, dimension: str) -> int:
+        return sum(max(0,int(applied.get(dimension,0))) for created_at,applied,_,_ in window if created_at >= farm_since)
 
     def _repeat_count(self, conn, identity: str, scope_kind: str, scope_id: str, dimension: str, evidence: str, since: float, signature: str | None = None) -> int:
         rows = conn.execute("SELECT applied_json,requested_json,evidence FROM events WHERE identity=? AND scope_kind=? AND scope_id=? AND created_at>=? AND actor='llm'", (identity, scope_kind, scope_id, since))

@@ -9,7 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-from astrbot_plugin_relation_arc.relation_engine import DEFAULT_VALUES, aggregate_effects, apply_delta, behavior_projection
+from astrbot_plugin_relation_arc.relation_engine import DEFAULT_VALUES, DIMENSIONS, aggregate_effects, apply_delta, behavior_projection
 from astrbot_plugin_relation_arc.relation_protocol import parse_response
 from astrbot_plugin_relation_arc.relation_store import SCHEMA_VERSION, RelationStore
 from astrbot_plugin_relation_arc.config_manager import PluginConfigManager
@@ -627,7 +627,7 @@ class SettlementAtomicityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = RelationStore(Path(directory))
             policy = self._policy()
-            with mock.patch.object(store, "_positive_window_total",
+            with mock.patch.object(store, "_window_positive_total",
                                    side_effect=[0, RuntimeError("injected failure")]):
                 with self.assertRaises(RuntimeError):
                     store.settle_turn(
@@ -838,6 +838,70 @@ class DecayPeriodTests(unittest.TestCase):
             store.set_dimension("qq:decay", "global", "", "trust", 300)
             store.adjust_dimension("qq:decay", "global", "", "trust", 5)
             self.assertEqual(12345.0, store.existing_account("qq:decay", "global", "")["last_interaction"])
+
+
+class WindowMergeEquivalenceTests(unittest.TestCase):
+    """MIS-97: merged window fetch is value-identical to per-dimension scans."""
+
+    def _seed(self, store):
+        import random
+        rng = random.Random(7)
+        now = time.time()
+        import sqlite3
+        conn = sqlite3.connect(store.path)
+        events = []
+        for index in range(200):
+            identity = f"qq:w-{rng.randrange(3)}"
+            trust = rng.randrange(-8, 9) or 1
+            comfort = rng.randrange(-8, 9) or 1
+            evidence = f"fact-{rng.randrange(6)}"
+            events.append((f"wev-{index}", identity, "global", "", "private",
+                           f"{evidence} | extra {index}", "r",
+                           json.dumps({"trust": trust, "comfort": comfort}),
+                           json.dumps({"trust": trust, "comfort": comfort}),
+                           "{}", "llm", now - rng.randrange(0, 30 * 3600)))
+        conn.executemany("INSERT INTO events(event_id,identity,scope_kind,scope_id,source_kind,evidence,reason,requested_json,applied_json,notes_json,actor,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", events)
+        conn.commit(); conn.close()
+        return now
+
+    def test_merged_window_matches_per_dimension_queries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            now = self._seed(store)
+            policy_window_minutes = 180
+            farm_window_hours = 24
+            repeat_since = now - policy_window_minutes * 60
+            farm_since = now - farm_window_hours * 3600
+            with store.lock, store._connection() as conn:
+                window = store._window_rows(conn, "qq:w-1", "global", "", min(repeat_since, farm_since))
+            for dimension in DIMENSIONS:
+                expected_repeat = store.repeat_count("qq:w-1", "global", "", dimension, "", repeat_since)
+                expected_positive = store.positive_window_total("qq:w-1", "global", "", dimension, farm_since)
+                self.assertEqual(expected_repeat,
+                                 store._window_repeat_count(window, repeat_since, dimension, "", None),
+                                 f"repeat mismatch {dimension}")
+                self.assertEqual(expected_positive,
+                                 store._window_positive_total(window, farm_since, dimension),
+                                 f"positive mismatch {dimension}")
+
+    def test_window_rows_with_evidence_split_and_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            now = time.time()
+            store.apply(event_id="w-1", identity="qq:s", scope_kind="global", scope_id="",
+                        source_kind="private", evidence="共同事实 | 其他", reason="r",
+                        requested={"trust": 2}, applied={"trust": 2}, notes={}, actor="llm")
+            store.apply(event_id="w-2", identity="qq:s", scope_kind="global", scope_id="",
+                        source_kind="private", evidence="共同事实", reason="r",
+                        requested={"trust": 2}, applied={"trust": 2}, notes={}, actor="llm")
+            signature = store.effect_signature({"trust": 2})
+            with store.lock, store._connection() as conn:
+                window = store._window_rows(conn, "qq:s", "global", "", now - 60)
+            # Evidence-substring matching counts both rows.
+            self.assertEqual(2, store._window_repeat_count(window, now - 60, "trust", "共同事实", None))
+            # Signature matching with empty evidence also counts both.
+            self.assertEqual(2, store._window_repeat_count(window, now - 60, "trust", "", signature))
+            self.assertEqual(4, store._window_positive_total(window, now - 60, "trust"))
 
 
 if __name__ == '__main__':
