@@ -16,7 +16,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 from .config_manager import PluginConfigManager
 from .relation_engine import (
-    DIMENSIONS, PUBLIC_DIMENSIONS, DISPLAY, aggregate_effects, apply_delta,
+    DEFAULT_VALUES, DIMENSIONS, PUBLIC_DIMENSIONS, DISPLAY, aggregate_effects, apply_delta,
     behavior_projection,
 )
 from .relation_protocol import BLOCK, leading_bare_json_span, parse_response, strip_protocol_text
@@ -226,7 +226,7 @@ class RelationArc(Star):
     def _effective_state(self, identity: str, scope_kind: str, scope_id: str, base_state: dict[str, str]) -> dict[str, str]:
         return {**base_state,"interaction_safety":self.store.effective_interaction_safety(identity,scope_kind,scope_id)}
 
-    def _summary(self, values: dict[str, int], state: dict[str, str], admin: bool = False) -> str:
+    def _summary(self, values: dict[str, int], state: dict[str, str], admin: bool = False, base_safety: str | None = None, timed: dict[str, Any] | None = None) -> str:
         value = lambda key: f"{values.get(key, 0) / 10:.1f}"
         lines = [f"{DISPLAY[key]}：{value(key)}" for key in PUBLIC_DIMENSIONS]
         global_enabled = self.config.get("romance", {}).get("global_enabled", True)
@@ -243,9 +243,18 @@ class RelationArc(Star):
                 lines.append("恋爱路线：可自然发展（不自动确认关系）")
             else:
                 lines.append("恋爱路线：显示意愿已记录，当前尚未满足可攻略条件")
+        safety_labels = {"slow_down": "建议放缓", "pause_intimacy": "暂缓亲密推进"}
         if state.get("interaction_safety", "normal") != "normal":
-            labels={"slow_down":"建议放缓","pause_intimacy":"暂缓亲密推进"}
-            lines.append(f"互动节奏：{labels.get(state.get('interaction_safety'), state.get('interaction_safety'))}")
+            lines.append(f"互动节奏：{safety_labels.get(state.get('interaction_safety'), state.get('interaction_safety'))}")
+        if admin and base_safety is not None:
+            # MIS-93: administrators see the administrator-owned base state, the
+            # current effective state and the automatic override's remaining
+            # time as three separate facts; models can never lower the base.
+            base = base_safety if base_safety != "normal" else "正常"
+            lines.append(f"基础节奏：{safety_labels.get(base, base)}")
+            if timed:
+                minutes = max(1, int(round((float(timed["expires_at"]) - time.time()) / 60)))
+                lines.append(f"当前有效：{safety_labels.get(timed['level'], timed['level'])}（自动，剩余约 {minutes} 分钟）")
         return "\n".join(lines)
 
     @filter.on_llm_request()
@@ -478,20 +487,34 @@ class RelationArc(Star):
             yield self._capability_denied(event); return
         scope_kind, scope_id = self._scope(event); identity=self._identity(event)
         account = self.store.account(identity, scope_kind, scope_id)
-        yield event.plain_result("【关系状态】\n" + self._summary(account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"]), str(event.get_sender_id()) in self.admins))
+        timed = self.store.active_timed_safety(identity, scope_kind, scope_id)
+        yield event.plain_result("【关系状态】\n" + self._summary(account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"]), str(event.get_sender_id()) in self.admins, base_safety=account["state"].get("interaction_safety","normal"), timed=timed))
 
     @filter.command("关系记录")
     async def history(self, event: AstrMessageEvent):
         if not self._capability_allowed(event,"self_query"):
             yield self._capability_denied(event); return
         scope_kind, scope_id = self._scope(event)
-        rows = self.store.recent(self._identity(event), scope_kind, scope_id)
+        identity = self._identity(event)
+        rows = self.store.recent(identity, scope_kind, scope_id)
+        account = self.store.existing_account(identity, scope_kind, scope_id)
+        values = account["values"] if account else dict(DEFAULT_VALUES)
+        base_state = account["state"] if account else {}
+        state = self._effective_state(identity, scope_kind, scope_id, base_state)
+        # MIS-93: one display projection for history. Romance stays behind the
+        # existing hiding policy and private-chat reasons never surface in a
+        # group, regardless of where the settlement happened.
+        is_group = self._is_group(event)
+        romance_visible = (not is_group) and self._romance_eligible(values, state)
+        show_reason = not is_group
         lines = ["【近期关系记录】"]
         for row in rows:
             changes = json.loads(row["applied_json"])
-            # Legacy audit rows may reference retired dimensions; render them without crashing.
-            shown = "、".join(f"{DISPLAY.get(key, key)} {change / 10:+.1f}" for key, change in changes.items() if change)
-            suffix = f"：{row['reason']}" if row.get("reason") else ""
+            shown = "、".join(
+                f"{DISPLAY.get(key, key)} {change / 10:+.1f}"
+                for key, change in changes.items()
+                if change and (key != "romance_interest" or romance_visible))
+            suffix = f"：{row['reason']}" if show_reason and row.get("reason") else ""
             lines.append(f"- {shown or '无变化'}{suffix}")
         yield event.plain_result("\n".join(lines))
 
@@ -504,14 +527,29 @@ class RelationArc(Star):
         # Same canonical/display(ID) resolver as management, but no writes.
         return self._target_identity(event, target, scope_kind, scope_id)
 
+    def _visible_accounts(self, scope_kind: str | None = None, scope_id: str | None = None) -> list[dict]:
+        """Accounts the requesting surface may see: excluded scopes are filtered
+        before pagination and totals, never after."""
+        page_size = 100
+        page = 1
+        visible: list[dict] = []
+        while True:
+            rows = self.store.list_accounts_page(page=page, page_size=page_size, scope_kind=scope_kind, scope_id=scope_id)
+            visible.extend(item for item in rows if self._stored_scope_allowed(item["scope_kind"], item["scope_id"]))
+            if len(rows) < page_size:
+                break
+            page += 1
+        return visible
+
     def _query_page(self, *, page: int, title: str, scope_kind: str | None = None, scope_id: str | None = None) -> str:
-        size=20; total=self.store.count_accounts(scope_kind,scope_id); pages=max(1,(total+size-1)//size); page=max(1,min(int(page),pages)); accounts=self.store.list_accounts_page(page=page,page_size=size,scope_kind=scope_kind,scope_id=scope_id)
-        rows=[]
-        for item in accounts:
-            label=item["identity"].rsplit(":",1)[-1]; public={k:item["values"].get(k,0)/10 for k in PUBLIC_DIMENSIONS}
-            binding=",".join(get_type(x["type_key"]).label for x in self.store.active_bindings_for(item["identity"],item["scope_kind"],item["scope_id"]) if get_type(x["type_key"])) or "无"
+        accounts = self._visible_accounts(scope_kind, scope_id)
+        size = 20; total = len(accounts); pages = max(1, (total + size - 1) // size); page = max(1, min(int(page), pages))
+        rows = []
+        for item in accounts[(page - 1) * size:page * size]:
+            label = item["identity"].rsplit(":", 1)[-1]; public = {k: item["values"].get(k, 0) / 10 for k in PUBLIC_DIMENSIONS}
+            binding = ",".join(get_type(x["type_key"]).label for x in self.store.active_bindings_for(item["identity"], item["scope_kind"], item["scope_id"]) if get_type(x["type_key"])) or "无"
             rows.append(f"- {label} | {item['scope_kind']} | 信赖 {public['trust']:.1f} 认可 {public['respect']:.1f} 安心 {public['comfort']:.1f} 亲近 {public['closeness']:.1f} 共鸣 {public['resonance']:.1f} | 正式关系 {binding}")
-        return f"【{title}】第 {page}/{pages} 页，共 {total} 条\n"+("\n".join(rows) if rows else "暂无记录")
+        return f"【{title}】第 {page}/{pages} 页，共 {total} 条\n" + ("\n".join(rows) if rows else "暂无记录")
 
     @filter.command("查询关系", alias={"查关系","查看关系"})
     async def query_relation(self, event: AstrMessageEvent, target: str = ""):
@@ -525,7 +563,7 @@ class RelationArc(Star):
             yield event.plain_result("当前 scope 未找到目标关系账户。")
             return
         state=self._effective_state(identity,scope_kind,scope_id,account["state"])
-        yield event.plain_result("【关系查询】\n"+self._summary(account["values"],state,str(event.get_sender_id()) in self.admins))
+        yield event.plain_result("【关系查询】\n"+self._summary(account["values"],state,str(event.get_sender_id()) in self.admins, base_safety=account["state"].get("interaction_safety","normal"), timed=self.store.active_timed_safety(identity,scope_kind,scope_id)))
 
     @filter.command("查询当前会话关系", alias={"查当前会话关系","查询本会话关系"})
     async def query_current_scope(self,event: AstrMessageEvent,page:int=1):
@@ -808,13 +846,21 @@ class RelationArc(Star):
         scope_filter = request.args.get("scope")
         if scope_filter not in {"global", "session"}:
             scope_filter = None
-        # Event cards deliberately omit identity, scope id, evidence, reason and raw notes.
-        return jsonify({"cards": self.store.audit_cards(scope_kind=scope_filter)})
+        # Event cards deliberately omit identity, evidence, reason and raw notes;
+        # MIS-93: excluded scopes are filtered out before any card is built.
+        cards = self.store.audit_cards(scope_kind=scope_filter, scope_allowed=self._stored_scope_allowed)
+        return jsonify({"cards": cards})
 
     async def _api_overview(self):
         from quart import jsonify
         accounts = [item for item in self.store.list_accounts(limit=500) if self._stored_scope_allowed(item["scope_kind"],item["scope_id"])]
-        return jsonify({"schema_version": 9, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": len(accounts), "global": sum(item["scope_kind"] == "global" for item in accounts), "session": sum(item["scope_kind"] == "session" for item in accounts)}, "bindings": self.store.binding_overview(), "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
+        bindings = [item for item in self.store.list_bindings(limit=500) if self._stored_scope_allowed(item["scope_kind"],item["scope_id"])]
+        binding_summary = {"total": len(bindings),
+                           "active": sum(item["status"] == "active" for item in bindings),
+                           "ended": sum(item["status"] == "ended" for item in bindings),
+                           "global": sum(item["scope_kind"] == "global" for item in bindings),
+                           "session": sum(item["scope_kind"] == "session" for item in bindings)}
+        return jsonify({"schema_version": 10, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": len(accounts), "global": sum(item["scope_kind"] == "global" for item in accounts), "session": sum(item["scope_kind"] == "session" for item in accounts)}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
 
     async def _api_health(self):
         from quart import jsonify

@@ -806,5 +806,122 @@ class SettlementHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, self.plugin.store.settlement_event_count("qq-adapter:user-1", "global", ""))
 
 
+class QueryVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-93: one visibility/scope/hiding policy across query and audit surfaces."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_group_history_hides_private_reason_and_romance(self):
+        identity = "qq-adapter:user-1"
+        store = self.plugin.store
+        store.account(identity, "global", "")
+        store.set_dimension(identity, "global", "", "trust", 600)
+        store.set_dimension(identity, "global", "", "comfort", 600)
+        store.set_dimension(identity, "global", "", "resonance", 500)
+        store.set_dimension(identity, "global", "", "closeness", 500)
+        store.set_state(identity, "global", "", romance_policy="shown", romance_state="eligible")
+        store.apply(event_id="priv-1", identity=identity, scope_kind="global", scope_id="",
+                    source_kind="private", evidence="私聊里的秘密", reason="私聊里的秘密",
+                    requested={"trust": 2, "romance_interest": 3},
+                    applied={"trust": 2, "romance_interest": 3}, notes={}, actor="llm")
+        group_event = FakeEvent(group_id="group-1", wake=True, outline="[At:bot-1] 看看")
+        group_event.message_obj = type("Message", (), {"message_id": "gh-1"})()
+        text = await self.plugin.history(group_event).__anext__()
+        self.assertNotIn("私聊里的秘密", text)
+        self.assertNotIn("恋爱意向", text)
+        self.assertIn("信赖 +0.2", text)
+        private_event = FakeEvent(user_id="user-1")
+        private_text = await self.plugin.history(private_event).__anext__()
+        self.assertIn("私聊里的秘密", private_text)
+        self.assertIn("恋爱意向 +0.3", private_text)
+
+    async def test_blocked_scope_hidden_from_bulk_query(self):
+        self.plugin.config["is_global_relation"] = False
+        self.plugin.config["blocked_sessions"] = ["group:9"]
+        store = self.plugin.store
+        store.account("qq:a", "session", "friend:1")
+        store.account("qq:b", "session", "group:9")
+        event = FakeEvent(user_id="admin")
+        text = await self.plugin.query_all_scopes(event).__anext__()
+        self.assertIn("共 1 条", text)
+        self.assertNotIn("| b |", text)
+        self.assertIn("- a | session", text)
+
+    async def test_audit_excludes_blocked_scope(self):
+        from quart import Quart
+        self.plugin.config["is_global_relation"] = False
+        self.plugin.config["blocked_sessions"] = ["group:9"]
+        self.plugin.store.apply(event_id="a-1", identity="qq:a", scope_kind="session",
+                                scope_id="friend:1", source_kind="private", evidence="",
+                                reason="r", requested={"trust": 1}, applied={"trust": 1},
+                                notes={}, actor="llm")
+        self.plugin.store.apply(event_id="b-1", identity="qq:b", scope_kind="session",
+                                scope_id="group:9", source_kind="group", evidence="",
+                                reason="r", requested={"trust": 1}, applied={"trust": 1},
+                                notes={}, actor="llm")
+        app = Quart(__name__)
+        async with app.test_request_context("/audit"):
+            result = await self.plugin._api_audit()
+        import json as jsonlib
+        payload = jsonlib.loads(await result.get_data())
+        self.assertEqual(1, len(payload["cards"]))
+        self.assertEqual("a-1", payload["cards"][0]["event_id"])
+
+    async def test_overview_bindings_exclude_blocked_scope(self):
+        self.plugin.config["is_global_relation"] = False
+        self.plugin.config["blocked_sessions"] = ["group:9"]
+        self.plugin.store.apply_turn_with_binding(
+            event_id="ob1", identity="qq:blocked", scope_kind="session", scope_id="group:9",
+            source_kind="group", evidence="", reason="", requested={}, applied={},
+            notes={}, binding={"binding_id": "ob1", "type_key": "romantic_partner",
+                               "unique_scope": "romance", "origin": "t", "summary": ""})
+        from quart import Quart
+        app = Quart(__name__)
+        async with app.app_context():
+            result = await self.plugin._api_overview()
+        import json as jsonlib
+        payload = jsonlib.loads(await result.get_data())
+        self.assertEqual(0, payload["bindings"]["total"])
+
+    async def test_admin_summary_distinguishes_base_effective_and_expiry(self):
+        identity = "qq-adapter:admin"
+        store = self.plugin.store
+        store.account(identity, "global", "")
+        store.set_interaction_safety_admin(identity, "global", "", "slow_down")
+        store.apply_turn_with_binding(
+            event_id="ts-admin", identity=identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding=None,
+            timed_safety={"level": "pause_intimacy", "duration_minutes": 30})
+        event = FakeEvent(user_id="admin")
+        text = await self.plugin.relation(event).__anext__()
+        self.assertIn("基础节奏：建议放缓", text)
+        self.assertIn("当前有效：暂缓亲密推进", text)
+        self.assertIn("剩余", text)
+
+    async def test_model_cannot_lower_admin_base_safety(self):
+        identity = "qq-adapter:user-9"
+        store = self.plugin.store
+        store.account(identity, "global", "")
+        store.set_interaction_safety_admin(identity, "global", "", "pause_intimacy")
+        payload = ('<relation_judgment>{"schema_version":3,"fact_effects":[],'
+                   '"interaction_safety_proposal":{"level":"slow_down","reason_code":"boundary_pressure"}}'
+                   "</relation_judgment>回复")
+        event = FakeEvent(user_id="user-9")
+        await self.plugin.judge(event, FakeResponse(payload))
+        account = store.existing_account(identity, "global", "")
+        self.assertEqual("pause_intimacy", account["state"]["interaction_safety"])
+        timed = store.active_timed_safety(identity, "global", "")
+        self.assertIsNone(timed)
+        self.assertEqual("pause_intimacy", store.effective_interaction_safety(identity, "global", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

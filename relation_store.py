@@ -542,9 +542,11 @@ class RelationStore:
             query += " ORDER BY created_at DESC LIMIT ?"
             return [dict(row) for row in conn.execute(query, (*args, max(1, min(limit, 500))))]
 
-    def audit_cards(self, limit: int = 200, scope_kind: str | None = None) -> list[dict[str, Any]]:
+    def audit_cards(self, limit: int = 200, scope_kind: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
         cards=[]
         for row in self.list_events(limit, scope_kind):
+            if scope_allowed is not None and not scope_allowed(row["scope_kind"], row["scope_id"]):
+                continue
             try: requested, applied, notes = json.loads(row["requested_json"]), json.loads(row["applied_json"]), json.loads(row["notes_json"])
             except json.JSONDecodeError: requested, applied, notes = {}, {}, {}
             cards.append({"event_id":row["event_id"],"scope_kind":row["scope_kind"],"source_kind":row["source_kind"],"actor":row["actor"],"created_at":row["created_at"],"requested":{k:int(v) for k,v in requested.items() if v},"applied":{k:int(v) for k,v in applied.items() if v},"policy":{k:v.get("notes",[]) for k,v in notes.items() if isinstance(v,dict) and v.get("notes")}})
