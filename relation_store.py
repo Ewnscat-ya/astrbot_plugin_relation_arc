@@ -810,8 +810,13 @@ class RelationStore:
         rows = conn.execute("SELECT applied_json FROM events WHERE identity=? AND scope_kind=? AND scope_id=? AND created_at>=? AND actor='llm'", (identity, scope_kind, scope_id, since))
         return sum(max(0, int(json.loads(row["applied_json"]).get(dimension, 0))) for row in rows)
 
-    def update_account_admin(self, *, identity: str, scope_kind: str, scope_id: str, expected_revision: int, values: dict[str, int], state_changes: dict[str, str], actor: str = "page_administrator") -> dict[str, Any] | None:
-        """Atomic optimistic-concurrency Pages update for an existing account."""
+    def update_account_admin(self, *, identity: str, scope_kind: str, scope_id: str, expected_revision: int, values: dict[str, int], state_changes: dict[str, str], actor: str = "page_administrator", cancel_timed: bool = False) -> dict[str, Any] | None:
+        """Atomic optimistic-concurrency Pages update for an existing account.
+
+        MIS-99: the automatic timed override is cancelled only when the
+        administrator explicitly edits interaction_safety (a literal safety
+        change) or passes cancel_timed=True; a dimensions-only edit keeps the
+        running timer untouched."""
         if scope_kind not in {"global","session"} or (scope_kind=="global" and scope_id) or (scope_kind=="session" and not scope_id): raise ValueError("invalid scope")
         if set(values) != set(DIMENSIONS): raise ValueError("all dimensions required")
         if any(not isinstance(value,int) or value<0 or value>1000 for value in values.values()): raise ValueError("invalid values")
@@ -824,7 +829,7 @@ class RelationStore:
             state={**account["state"],**allowed}; now=time.time()
             # An explicit Pages safety edit is administrator authority and must
             # cancel the automatic override in the same transaction.
-            if "interaction_safety" in allowed:
+            if "interaction_safety" in allowed or cancel_timed:
                 conn.execute("DELETE FROM timed_safety WHERE identity=? AND scope_kind=? AND scope_id=?",(identity,scope_kind,scope_id))
             conn.execute("UPDATE accounts SET values_json=?,state_json=?,revision=?,updated_at=? WHERE identity=? AND scope_kind=? AND scope_id=?",(json.dumps(values),json.dumps(state),expected_revision+1,now,identity,scope_kind,scope_id))
             requested={k:int(values[k])-int(account["values"].get(k,0)) for k in DIMENSIONS if int(values[k])!=int(account["values"].get(k,0))}

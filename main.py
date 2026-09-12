@@ -14,7 +14,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import At, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
-from .config_manager import PluginConfigManager
+from .config_manager import ConfigRevisionConflict, PluginConfigManager
 from .relation_engine import (
     DEFAULT_VALUES, DIMENSIONS, PUBLIC_DIMENSIONS, DISPLAY, aggregate_effects, apply_delta,
     behavior_projection,
@@ -31,7 +31,21 @@ ALIASES = {
 }
 
 
-@register(PLUGIN_NAME, "Ewnscat", "独立多维关系、风格投影与可审计关系账本", "0.1.0")
+# MIS-99: metadata.yaml is the single source of truth for the plugin version
+# (the @register decorator and the Pages overview both read from here).
+def _read_plugin_version() -> str:
+    import re
+    try:
+        match = re.search(r"^version:\s*(.+)$", (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8"), re.M)
+        if match:
+            return match.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "0.1.0"
+
+PLUGIN_VERSION = _read_plugin_version()
+
+@register(PLUGIN_NAME, "Ewnscat", "独立多维关系、风格投影与可审计关系账本", PLUGIN_VERSION)
 class RelationArc(Star):
     def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
@@ -41,6 +55,7 @@ class RelationArc(Star):
         self.config = self.config_mgr.load_or_create()
         self.admins = {str(item) for item in host_config.get("admins_id", [])}
         self.store = RelationStore(data_root / "plugin_data" / PLUGIN_NAME, self.config)
+        self.plugin_version = PLUGIN_VERSION
         self._decay_task: asyncio.Task | None = None
         self._backup_task: asyncio.Task | None = None
         self._decay_sig: str | None = None
@@ -898,12 +913,17 @@ class RelationArc(Star):
         data = await request.get_json()
         if not isinstance(data, dict):
             return jsonify({"error": "配置必须是 JSON 对象"}), 400
+        expected = data.pop("expected_revision", None)
+        if expected is not None and type(expected) is not int:
+            return jsonify({"error": "expected_revision 必须是整数"}), 400
         try:
-            self.config = self.config_mgr.update(data)
-        except ValueError:
-            return jsonify({"error": "配置字段类型或范围无效"}), 400
-        await self._restart_decay_scheduler()
-        return jsonify({"success": True})
+            self.config = self.config_mgr.update(data, expected_revision=expected)
+        except ConfigRevisionConflict as exc:
+            return jsonify({"error": "配置已被其他窗口更新，请刷新后重试", "current_revision": exc.current_revision}), 409
+        except ValueError as exc:
+            return jsonify({"error": f"配置无效：{exc}"}), 400
+        await self._restart_schedulers()
+        return jsonify({"success": True, "config_revision": self.config.get("config_revision", 0)})
 
     async def _api_accounts(self):
         from quart import request, jsonify
@@ -916,13 +936,24 @@ class RelationArc(Star):
                 if type(revision) is not int or revision < 0 or not isinstance(raw_values,dict): raise ValueError("invalid revision or values")
                 values={key:self._numeric_tenths(raw_values[key]) for key in DIMENSIONS}
             except (TypeError,ValueError,KeyError,OverflowError): return jsonify({"error":"revision 或六维值无效"}),400
+            # MIS-99: safety/policy are explicit-only. Omitting them keeps the
+            # route, the base safety and any running automatic timer intact.
+            has_policy = "romance_policy" in payload
+            has_safety = "interaction_safety" in payload
             policy=str(payload.get("romance_policy", "")); safety=str(payload.get("interaction_safety", ""))
-            if policy not in {"hidden","observing","shown"} or safety not in {"normal","slow_down","pause_intimacy"}: return jsonify({"error":"路线或互动节奏无效"}),400
+            if has_policy and policy not in {"hidden","observing","shown"}: return jsonify({"error":"路线无效"}),400
+            if has_safety and safety not in {"normal","slow_down","pause_intimacy"}: return jsonify({"error":"互动节奏无效"}),400
             if not self._stored_scope_allowed(scope_kind,scope_id): return jsonify({"error":"当前 scope 未开放"}),403
             current=self.store.existing_account(identity,scope_kind,scope_id)
             if not current: return jsonify({"error":"目标账户不存在；拒绝隐式创建"}),404
-            romance_state="hidden" if policy=="hidden" else "observing" if policy=="observing" else ("eligible" if self._romance_thresholds_met(values) else "observing")
-            try: account=self.store.update_account_admin(identity=identity,scope_kind=scope_kind,scope_id=scope_id,expected_revision=revision,values=values,state_changes={"romance_policy":policy,"romance_state":romance_state,"interaction_safety":safety})
+            state_changes={}
+            if has_policy:
+                state_changes["romance_policy"]=policy
+                state_changes["romance_state"]="hidden" if policy=="hidden" else "observing" if policy=="observing" else ("eligible" if self._romance_thresholds_met(values) else "observing")
+            if has_safety:
+                state_changes["interaction_safety"]=safety
+            cancel_timed = payload.get("clear_timed_safety") is True
+            try: account=self.store.update_account_admin(identity=identity,scope_kind=scope_kind,scope_id=scope_id,expected_revision=revision,values=values,state_changes=state_changes,cancel_timed=cancel_timed)
             except RuntimeError: return jsonify({"error":"账户已被更新，请刷新后重试"}),409
             except ValueError: return jsonify({"error":"账户或 scope 无效"}),400
             return jsonify({"success":True,"account":account})
@@ -971,7 +1002,7 @@ class RelationArc(Star):
                            "ended": binding_ended,
                            "global": binding_global,
                            "session": binding_session}
-        return jsonify({"schema_version": 11, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": account_total, "global": account_global, "session": account_session}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
+        return jsonify({"schema_version": 11, "plugin_version": self.plugin_version, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": account_total, "global": account_global, "session": account_session}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
 
     async def _api_health(self):
         from quart import jsonify

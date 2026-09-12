@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -993,6 +994,130 @@ class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
         import json as jsonlib
         payload = jsonlib.loads(await result.get_data())
         self.assertTrue(payload["scheduler"]["last_success"])
+
+
+class ConfigAccountEditTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-99: explicit-only safety changes, revision conflicts, specific errors."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _post_accounts(self, payload):
+        from quart import Quart
+        app = Quart(__name__)
+        async with app.test_request_context("/accounts", method="POST",
+                                             data=json.dumps(payload),
+                                             headers={"Content-Type": "application/json"}):
+            return await self.plugin._api_accounts()
+
+    async def test_dimension_only_edit_keeps_timed(self):
+        identity = "qq-adapter:user-1"
+        store = self.plugin.store
+        account = store.account(identity, "global", "")
+        store.set_dimension(identity, "global", "", "trust", 500)
+        store.apply_turn_with_binding(
+            event_id="ts-keep", identity=identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding=None,
+            timed_safety={"level": "slow_down", "duration_minutes": 60})
+        before_revision = store.existing_account(identity, "global", "")["revision"]
+        payload = {"action": "update_account", "identity": identity, "scope_kind": "global",
+                   "scope_id": "", "revision": before_revision,
+                   "values": {"trust": 60.0, "respect": 50.0, "comfort": 45.0,
+                              "closeness": 15.0, "resonance": 10.0, "romance_interest": 0}}
+        await self._post_accounts(payload)
+        after = store.existing_account(identity, "global", "")
+        self.assertEqual(600, after["values"]["trust"])
+        self.assertEqual("slow_down", store.active_timed_safety(identity, "global", "")["level"])
+        self.assertEqual("normal", after["state"]["interaction_safety"])
+
+    async def test_explicit_safety_change_cancels_timed(self):
+        identity = "qq-adapter:user-2"
+        store = self.plugin.store
+        store.account(identity, "global", "")
+        store.apply_turn_with_binding(
+            event_id="ts-2", identity=identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding=None,
+            timed_safety={"level": "slow_down", "duration_minutes": 60})
+        payload = {"action": "update_account", "identity": identity, "scope_kind": "global",
+                   "scope_id": "", "revision": 1, "romance_policy": "hidden",
+                   "interaction_safety": "normal",
+                   "values": {"trust": 40.0, "respect": 50.0, "comfort": 45.0,
+                              "closeness": 15.0, "resonance": 10.0, "romance_interest": 0}}
+        await self._post_accounts(payload)
+        after = store.existing_account(identity, "global", "")
+        self.assertEqual("normal", after["state"]["interaction_safety"])
+        self.assertIsNone(store.active_timed_safety(identity, "global", ""))
+
+    async def test_clear_timed_safety_explicit_action(self):
+        identity = "qq-adapter:user-3"
+        store = self.plugin.store
+        store.account(identity, "global", "")
+        store.apply_turn_with_binding(
+            event_id="ts-3", identity=identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={},
+            notes={}, binding=None,
+            timed_safety={"level": "pause_intimacy", "duration_minutes": 120})
+        payload = {"action": "update_account", "identity": identity, "scope_kind": "global",
+                   "scope_id": "", "revision": 1, "clear_timed_safety": True,
+                   "values": {"trust": 40.0, "respect": 50.0, "comfort": 45.0,
+                              "closeness": 15.0, "resonance": 10.0, "romance_interest": 0}}
+        await self._post_accounts(payload)
+        self.assertIsNone(store.active_timed_safety(identity, "global", ""))
+        self.assertEqual(400, store.existing_account(identity, "global", "")["values"]["trust"])
+
+    async def test_config_revision_conflict_409_and_success(self):
+        from quart import Quart
+        app = Quart(__name__)
+        current = self.plugin.config.get("config_revision", 0)
+        stale = {"raw_delta_limit": 8, "expected_revision": current + 5}
+        async with app.test_request_context("/config", method="POST",
+                                             data=json.dumps(stale),
+                                             headers={"Content-Type": "application/json"}):
+            body, status = await self.plugin._api_config()
+        self.assertEqual(409, status)
+        # The server reports its own current revision for conflict recovery.
+        self.assertEqual(0, json.loads((await body.get_data()))["current_revision"])
+        ok = {"raw_delta_limit": 8, "expected_revision": current}
+        async with app.test_request_context("/config", method="POST",
+                                             data=json.dumps(ok),
+                                             headers={"Content-Type": "application/json"}):
+            result = await self.plugin._api_config()
+        self.assertEqual(200, result.status_code)
+        self.assertTrue(json.loads((await result.get_data()))["success"])
+        self.assertEqual(8, self.plugin.config["raw_delta_limit"])
+
+    async def test_config_unknown_fields_named_in_error(self):
+        from quart import Quart
+        app = Quart(__name__)
+        bad = {"totally_unknown_field": 1}
+        async with app.test_request_context("/config", method="POST",
+                                             data=json.dumps(bad),
+                                             headers={"Content-Type": "application/json"}):
+            body, status = await self.plugin._api_config()
+        self.assertEqual(400, status)
+        self.assertIn("totally_unknown_field", (await body.get_data()).decode("utf-8"))
+
+    async def test_config_invalid_value_error_is_specific(self):
+        from quart import Quart
+        app = Quart(__name__)
+        bad = {"raw_delta_limit": 99}
+        async with app.test_request_context("/config", method="POST",
+                                             data=json.dumps(bad),
+                                             headers={"Content-Type": "application/json"}):
+            body, status = await self.plugin._api_config()
+        self.assertEqual(400, status)
+        self.assertIn("raw_delta_limit", (await body.get_data()).decode("utf-8"))
+
+    def test_plugin_version_from_metadata(self):
+        self.assertEqual("0.1.0", self.plugin.plugin_version)
 
 
 if __name__ == "__main__":

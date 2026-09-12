@@ -52,7 +52,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # identities, evidence, reasons, or model reasoning.
     "protocol_health": {"enabled": True, "retention_days": 30},
     "decay": {"enabled": False, "interval_minutes": 60, "inactive_hours": 168, "step": 5, "floors": {"trust": 0, "respect": 0, "comfort": 0, "closeness": 0, "resonance": 0, "romance_interest": 0}},
-    "auto_blacklist": {"enabled": False, "settlement_limit": 100}, 
+    "auto_blacklist": {"enabled": False, "settlement_limit": 100},
+    # MIS-99: save-revision counter, separate from the business config_version.
+    "config_revision": 0,
 }
 
 
@@ -61,6 +63,18 @@ def _merge(base: dict, incoming: dict) -> dict:
     for key, value in incoming.items():
         result[key] = _merge(result[key], value) if key in result and isinstance(result[key], dict) and isinstance(value, dict) else value
     return result
+
+
+class ConfigRevisionConflict(ValueError):
+    """MIS-99: the caller's config revision is stale; retry with fresh data."""
+    def __init__(self, current_revision: int):
+        super().__init__(f"config revision conflict; current={current_revision}")
+        self.current_revision = current_revision
+
+
+class UnknownConfigFields(ValueError):
+    """MIS-99: unknown top-level fields are named, never silently merged."""
+    pass
 
 
 class PluginConfigManager:
@@ -126,14 +140,29 @@ class PluginConfigManager:
         temporary.write_text(json.dumps(self.config if candidate is None else candidate, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
 
-    def update(self, value: dict[str, Any]) -> dict[str, Any]:
+    def update(self, value: dict[str, Any], expected_revision: int | None = None) -> dict[str, Any]:
+        """MIS-99: partial config update with revision conflict detection.
+
+        ``expected_revision`` (the caller's last seen ``config_revision``) is
+        compared inside the same critical section as validation; a mismatch
+        raises ConfigRevisionConflict carrying the current revision. Unknown
+        top-level fields are named in the error instead of being silently
+        merged or reset."""
         if not isinstance(value, dict):
             raise ValueError("config must be an object")
         if "config_version" in value and type(value["config_version"]) is not int:
             raise ValueError("config_version must be an integer")
-        # Pages submits a full form today, but v5 accepts safe partial patches too.
-        # Merge from the active config so omitted keys cannot silently reset.
-        candidate = _merge(self.config or DEFAULT_CONFIG, value)
+        unknown = sorted(set(value) - set(DEFAULT_CONFIG) - {"config_revision"})
+        if unknown:
+            raise ValueError("unknown config fields: " + ", ".join(unknown))
+        base = self.config or copy.deepcopy(DEFAULT_CONFIG)
+        if expected_revision is not None:
+            if type(expected_revision) is not int:
+                raise ValueError("expected_revision must be an integer")
+            if int(base.get("config_revision", 0)) != expected_revision:
+                raise ConfigRevisionConflict(int(base.get("config_revision", 0)))
+        candidate = _merge(base, value)
+        candidate["config_revision"] = int(base.get("config_revision", 0)) + 1
         candidate["config_version"] = CONFIG_VERSION
         self._validate(candidate)
         # Publish only after atomic replacement; keep caller root aliases live.
