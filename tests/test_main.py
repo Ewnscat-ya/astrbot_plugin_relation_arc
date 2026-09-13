@@ -412,7 +412,9 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
         dynamic, contract = (part.text for part in req.extra_user_content_parts)
         self.assertIn("反强推保护", dynamic)
         self.assertIn("单方表白、土味情话", dynamic)
-        self.assertIn("礼物按角色人设、自然度和频率判断", dynamic)
+        # MIS-127 R4: the gift rule is stated once, in the dynamic block.
+        self.assertIn("礼物按角色人设、自然度、频率判断", dynamic)
+        self.assertEqual(1, dynamic.count("礼物按角色人设"))
         self.assertIn("romance_interest", contract)
 
     async def test_admin_display_target_resolves_to_existing_event_identity(self):
@@ -875,6 +877,56 @@ class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_different_first_evidence_does_not_decay_on_signature(self):
         self.assertEqual([10, 10], await self._deltas([("first-A", "later"), ("first-B", "later")]))
+
+
+class PromptSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-127 R4: the real inject chain ships the slimmed prompt - five
+    candidate types always listed (no per-turn threshold matrix), the upgrade
+    recognition note, and the cross-user occupancy only as a boolean while
+    the active policy keeps it on. Exactly two text parts are appended and no
+    model/thinking parameters are touched."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _inject(self):
+        event = FakeEvent()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.assertEqual("persona", req.system_prompt)  # thinking params untouched
+        return req.extra_user_content_parts
+
+    async def test_slim_prompt_contract(self):
+        parts = await self._inject()
+        self.assertEqual(2, len(parts))
+        joined = parts[0].text + parts[1].text
+        for key in ("friend", "close_friend", "partner", "romantic_partner", "spouse"):
+            self.assertIn(key, joined)  # candidates are never pruned
+        self.assertNotIn("≥", joined)  # no numeric gate matrix injected
+        self.assertIn("升级", joined)
+        self.assertIn("以结算结果为准", joined)
+        self.assertNotIn("占用", joined)  # exclusivity off: no occupancy line
+        # Record the slim sizes for the delivery evidence.
+        print(f"PROMPT_SNAPSHOT dynamic={len(parts[0].text)} contract={len(parts[1].text)} total={len(joined)}")
+
+    async def test_exclusivity_on_shows_boolean_occupancy_only(self):
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        parts = await self._inject()
+        joined = parts[0].text + parts[1].text
+        self.assertIn("同 scope 恋爱位置已被他人占用：false", joined)
+        self.assertNotIn("qq-", joined)  # no other identity leaks
+
+    async def test_effective_policy_drives_the_injection(self):
+        # A saved-but-not-activated desired value must NOT change the prompt.
+        self.plugin.config["binding_policy"]["exclusivity"] = "scope"
+        parts = await self._inject()
+        self.assertNotIn("占用", parts[0].text + parts[1].text)
 
 
 class UpgradeCooldownTests(unittest.IsolatedAsyncioTestCase):
