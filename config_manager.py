@@ -197,6 +197,10 @@ class PluginConfigManager:
         # records that key as an explicit administrator choice; untouched keys
         # keep their original source.
         incoming_policy = value.get("binding_policy") if isinstance(value.get("binding_policy"), dict) else {}
+        # MIS-134 C09: the source is NOT client-writable — it is produced only
+        # by the migration and by the actual-change logic below, never by a
+        # submitted binding_policy_source value.
+        candidate["binding_policy_source"] = copy.deepcopy(base.get("binding_policy_source", {}))
         for key in ("exclusivity", "rebind_cooldown"):
             if key in incoming_policy and incoming_policy[key] != base.get("binding_policy", {}).get(key):
                 candidate["binding_policy_source"][key] = "admin"

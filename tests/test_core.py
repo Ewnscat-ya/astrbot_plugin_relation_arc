@@ -3,8 +3,10 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
@@ -996,6 +998,256 @@ class BindingPolicyConstraintTests(unittest.TestCase):
             self.assertTrue(store.end_binding("dup-2", "admin"))
             self.assertEqual(0, store.legacy_binding_conflict_count())
             self.assertEqual("binding_created", self._bind(store, "f5", "qq:dup", type_key="close_friend"))
+
+
+class ConcurrentRestoreTests(unittest.TestCase):
+    """MIS-134 C01/C03: two independent Store instances restoring with real
+    thread interleaving must never produce an empty live database, a fake
+    success, or a clobbered policy activation. Only legal interleaving is
+    arranged (barriers/events) — no injected deletions or exceptions."""
+
+    def _store(self, directory: Path, exclusivity: str = "none"):
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": exclusivity, "rebind_cooldown": "off"}})
+        store.activate_binding_policy({"exclusivity": exclusivity, "rebind_cooldown": "off"})
+        return store
+
+    def _seed(self, store: RelationStore, identity: str, trust: int):
+        store.account(identity, "global", "")
+        store.set_dimension(identity, "global", "", "trust", trust)
+
+    def _live_shape(self, directory: Path) -> dict:
+        conn = sqlite3.connect(directory / "relation_arc.sqlite3")
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()]
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            accounts = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] if "accounts" in tables else -1
+        finally:
+            conn.close()
+        return {"version": version, "tables": len(tables), "accounts": accounts}
+
+    def test_concurrent_restore_same_backup_never_empties_live(self):
+        # C01: store A finishes staging verification and pauses; store B
+        # completes the whole restore (including staging cleanup); only then
+        # does A perform its final copy.
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store_a = self._store(directory)
+            store_b = self._store(directory)
+            self._seed(store_a, "qq:a", 555)
+            backup = store_a.backup_now("manual")
+            original_verify = RelationStore._verify_staging
+            verified_a = threading.Event()
+            restore_b_done = threading.Event()
+
+            def verify_a(self, staging):
+                original_verify(self, staging)
+                if staging is store_a_staging[0]:
+                    verified_a.set()
+                    restore_b_done.wait(10)
+
+            store_a_staging = [None]
+            real_inject = RelationStore._inject_staging_policy
+
+            def inject_a(self, staging, policy):
+                store_a_staging[0] = staging
+                return real_inject(self, staging, policy)
+
+            results = {}
+
+            def run_a():
+                with mock.patch.object(store_a, "_verify_staging", new=lambda s: verify_a(store_a, s)), \
+                     mock.patch.object(store_a, "_inject_staging_policy", new=lambda s, p: inject_a(store_a, s, p)):
+                    results["a"] = store_a.restore_backup(backup.name, kind="manual")
+
+            def run_b():
+                verified_a.wait(10)
+                try:
+                    with mock.patch.object(store_b, "_verify_staging", new=lambda s: original_verify(store_b, s)):
+                        results["b"] = store_b.restore_backup(backup.name, kind="manual")
+                except ValueError as error:
+                    # MIS-134 C01: the second concurrent restore fails fast
+                    # with a retryable error instead of clobbering staging.
+                    results["b_error"] = str(error)
+                restore_b_done.set()
+
+            thread_a = threading.Thread(target=run_a)
+            thread_b = threading.Thread(target=run_b)
+            thread_a.start(); thread_b.start()
+            thread_a.join(30); thread_b.join(30)
+            self.assertFalse(thread_a.is_alive() or thread_b.is_alive(), "restore threads deadlocked")
+            self.assertIn("a", results)
+            self.assertIn("b_error", results)
+            self.assertIn("another restore is in progress", results["b_error"])
+            # A completes on its own private staging even though B's cleanup
+            # of the OLD shared-name staging happened in between (the staging
+            # names no longer collide, so no empty-database copy is possible).
+            self.assertEqual(SCHEMA_VERSION, results["a"]["schema_version"])
+            self.assertEqual("ok", results["a"]["integrity"])
+            shape = self._live_shape(directory)
+            self.assertEqual(SCHEMA_VERSION, shape["version"])
+            self.assertGreaterEqual(shape["tables"], 8)
+            self.assertEqual(1, shape["accounts"])
+            # The refused restore is retryable: once A finished, B succeeds.
+            results["b"] = store_b.restore_backup(backup.name, kind="manual")
+            self.assertEqual(SCHEMA_VERSION, results["b"]["schema_version"])
+
+    def test_restore_keeps_concurrent_activation_and_fresh_epoch(self):
+        # C03: activation racing a restore is refused while the lease is
+        # held; the restore completes on the CURRENT policy with a brand-new
+        # epoch, and requests pinned to the old epoch can no longer bind.
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store_a = self._store(directory, exclusivity="none")
+            self._seed(store_a, "qq:a", 555)
+            backup = store_a.backup_now("manual")
+            epoch_before = store_a.active_binding_policy()["epoch"]
+
+            injected_a = threading.Event()
+            activation_done = threading.Event()
+            real_inject = RelationStore._inject_staging_policy
+            activation_result = {}
+
+            def inject_a(self, staging, policy):
+                out = real_inject(self, staging, policy)
+                injected_a.set()
+                activation_done.wait(10)
+                return out
+
+            def run_b():
+                injected_a.wait(10)
+                other = self._store(directory, exclusivity="none")
+                activation_result["value"] = other.activate_binding_policy(
+                    {"exclusivity": "scope", "rebind_cooldown": "off"})
+                activation_done.set()
+
+            with mock.patch.object(store_a, "_inject_staging_policy", new=lambda s, p: inject_a(store_a, s, p)):
+                thread_b = threading.Thread(target=run_b)
+                thread_b.start()
+                result = store_a.restore_backup(backup.name, kind="manual")
+                thread_b.join(30)
+            self.assertFalse(thread_b.is_alive())
+            self.assertEqual("restore_in_progress", activation_result["value"]["reason"])
+            # The live policy is the restored one with a fresh, never-reused
+            # epoch; requests pinned to the previous epoch can no longer bind.
+            self.assertEqual("none", result["policy"]["exclusivity"])
+            self.assertEqual(epoch_before + 1, result["policy"]["epoch"])
+            self.assertEqual("none", store_a.active_binding_policy()["exclusivity"])
+            self.assertEqual("binding_rejected:policy_changed",
+                             store_a.apply_turn_with_binding(
+                                 event_id="stale-1", identity="qq:stale", scope_kind="global", scope_id="",
+                                 source_kind="test", evidence="", reason="", requested={}, applied={},
+                                 notes={}, binding={"binding_id": "b-stale", "type_key": "friend",
+                                                    "unique_scope": "", "origin": "test", "summary": ""},
+                                 expected_epoch=epoch_before)[1])
+
+
+
+
+
+class LegacyConflictBootTests(unittest.TestCase):
+    """MIS-134 C02/C04: a pre-v12 ledger that already carries same-user
+    duplicates, two romance tiers for one identity, or multi-user romance
+    occupancy must OPEN cleanly with the conflicts diagnosed — never fail
+    construction — and the administrator can end exact bindings to clear
+    them, after which the constraint indexes return."""
+
+    def _conflicted_ledger(self, directory: Path) -> None:
+        # No explicit activation: with a config-less store the binding_policy
+        # row seeds from the legacy fallback (scope/type_default) — exactly
+        # the state of a real pre-v12 database after the upgrade.
+        store = RelationStore(directory)
+        raw = sqlite3.connect(directory / "relation_arc.sqlite3")
+        # A real conflicted v11 ledger never had the constraint indexes (the
+        # audit-first boot kept them absent), so drop all of them here too.
+        raw.execute("DROP INDEX IF EXISTS idx_binding_identity_type_uq")
+        raw.execute("DROP INDEX IF EXISTS idx_binding_identity_romance_uq")
+        raw.execute("DROP INDEX IF EXISTS idx_binding_romance_scope_uq")
+        # Two duplicated friend bindings + one partner duplicate (C04: two
+        # distinct duplicated types for the same identity), a two-tier
+        # romance pair and a second user's romance in the same scope (C02).
+        for binding_id, identity, type_key in (
+                ("dup-f1", "qq:dup", "friend"), ("dup-f2", "qq:dup", "friend"),
+                ("dup-p1", "qq:dup", "partner"), ("dup-p2", "qq:dup", "partner"),
+                ("tier-lo", "qq:two", "romantic_partner"), ("tier-hi", "qq:two", "spouse"),
+                ("other-u", "qq:other", "romantic_partner")):
+            raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES(?,?,?,?,?,'active','romance','seed','{}',1,1,NULL,'')",
+                        (binding_id, identity, "global", "", type_key))
+        raw.commit()
+        raw.close()
+        store.close()
+
+    def test_conflicted_ledger_boots_with_full_diagnosis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self._conflicted_ledger(directory)
+            # Construction must not raise; every conflict kind is diagnosed.
+            store = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            with store._connection() as conn:
+                kinds = sorted(row["kind"] for row in conn.execute("SELECT DISTINCT kind FROM binding_conflicts").fetchall())
+            self.assertIn("identity_type:friend", kinds)
+            self.assertIn("identity_type:partner", kinds)
+            self.assertIn("identity_romance", kinds)
+
+    def test_conflicted_ledger_boots_under_scope_policy_without_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self._conflicted_ledger(directory)
+            # The legacy policy fallback is scope: the multi-user romance
+            # occupancy must be diagnosed instead of breaking the boot, and
+            # the cross-user index stays absent while the conflict exists.
+            store = RelationStore(directory)
+            with store._connection() as conn:
+                self.assertFalse(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_romance_scope_uq'").fetchone())
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM binding_conflicts WHERE identity='' AND kind='scope_exclusive'").fetchone())
+            # Romance writes in the conflicted scope are refused...
+            self.assertEqual("binding_rejected:legacy_conflict",
+                             store.apply_turn_with_binding(
+                                 event_id="x1", identity="qq:new", scope_kind="global", scope_id="",
+                                 source_kind="test", evidence="", reason="", requested={}, applied={}, notes={},
+                                 binding={"binding_id": "b-x1", "type_key": "spouse", "unique_scope": "romance",
+                                          "origin": "test", "summary": ""})[1])
+            # ...while a friend binding for a fresh identity keeps working.
+            self.assertEqual("binding_created",
+                             store.apply_turn_with_binding(
+                                 event_id="x2", identity="qq:new", scope_kind="global", scope_id="",
+                                 source_kind="test", evidence="", reason="", requested={}, applied={}, notes={},
+                                 binding={"binding_id": "b-x2", "type_key": "friend", "unique_scope": "",
+                                          "origin": "test", "summary": ""})[1])
+
+    def test_ending_conflicts_restores_indexes_and_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            self._conflicted_ledger(directory)
+            store = RelationStore(directory)
+            # Clear the cross-user romance conflict: one of the two users
+            # ends their romance binding by exact binding_id.
+            self.assertTrue(store.end_binding("other-u", "admin"))
+            self.assertTrue(store.end_binding("tier-lo", "admin"))  # the upgraded-tier duplicate pair member
+            with store._connection() as conn:
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_romance_scope_uq'").fetchone())
+            # Remaining same-type duplicates still diagnosed (C04: separate).
+            with store._connection() as conn:
+                kinds = sorted(row["kind"] for row in conn.execute("SELECT DISTINCT kind FROM binding_conflicts").fetchall())
+            self.assertEqual(["identity_type:friend", "identity_type:partner"], kinds)
+            # Clearing one duplicate type leaves the other visible and
+            # blocking; clearing both reopens the identity's writes.
+            self.assertTrue(store.end_binding("dup-f2", "admin"))
+            with store._connection() as conn:
+                kinds = sorted(row["kind"] for row in conn.execute("SELECT DISTINCT kind FROM binding_conflicts").fetchall())
+            self.assertEqual(["identity_type:partner"], kinds)
+            self.assertTrue(store.end_binding("dup-p2", "admin"))
+            self.assertEqual(0, store.legacy_binding_conflict_count())
+            self.assertEqual("binding_created",
+                             store.apply_turn_with_binding(
+                                 event_id="x3", identity="qq:dup", scope_kind="global", scope_id="",
+                                 source_kind="test", evidence="", reason="", requested={}, applied={}, notes={},
+                                 binding={"binding_id": "b-x3", "type_key": "close_friend", "unique_scope": "",
+                                          "origin": "test", "summary": ""})[1])
+
 
 
 class RestoreMigrationTests(unittest.TestCase):

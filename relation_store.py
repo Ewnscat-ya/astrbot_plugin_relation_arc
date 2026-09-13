@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -132,6 +133,10 @@ class RelationStore:
         # never deleted; rows here block only the writes that would aggravate
         # the conflict for that identity/scope.
         conn.execute("CREATE TABLE IF NOT EXISTS binding_conflicts (identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, kind TEXT NOT NULL, conflict_count INTEGER NOT NULL, first_seen REAL NOT NULL, PRIMARY KEY(identity,scope_kind,scope_id,kind))")
+        # MIS-134 C01/C03: cross-instance mutual exclusion between the restore
+        # final phase and policy activation. Single row, time-bounded: a
+        # crashed restore never blocks activation forever.
+        conn.execute("CREATE TABLE IF NOT EXISTS restore_lease (id INTEGER PRIMARY KEY CHECK(id=1), until REAL NOT NULL, owner TEXT NOT NULL DEFAULT '')")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
         # MIS-125 R2: the blanket unique index enforced cross-user romance
@@ -205,29 +210,33 @@ class RelationStore:
             raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")
 
     def _reconcile_binding_constraints(self, conn) -> dict[str, Any]:
-        """MIS-125 R2: align the constraint objects with the authoritative
-        policy row, inside the caller's transaction.
+        """MIS-125 R2 / MIS-134 C02+C04: align the constraint objects with
+        the authoritative policy row, inside the caller's transaction.
 
-        The old blanket unique index is replaced by two independent layers:
-        the optional cross-user romance exclusion (a type-scoped unique index
-        that exists only while the active policy says scope) and the
-        same-user uniqueness rules, which are only created on a clean ledger.
-        Historical conflicts are kept and diagnosed in binding_conflicts -
-        never deleted, never auto-ended - and they block only the writes that
-        would aggravate them."""
+        Diagnosis always runs BEFORE any constraint object is created: a
+        ledger that already carries same-user duplicates or a multi-user
+        romance occupancy (possible in pre-v12 databases) keeps its rows and
+        gets them recorded in binding_conflicts — the affected indexes stay
+        absent until the conflicts are resolved, so opening the plugin never
+        fails and the administrator can end exact bindings to clear them."""
         policy = self._active_policy_row(conn)
-        if policy["exclusivity"] == "scope":
+        conflicts = self._same_user_conflicts(conn)
+        # MIS-134 C02: the index predicate is scope-level uniqueness among
+        # active romance rows, so ANY duplicate there (cross-user or the
+        # same user holding two tiers) blocks its creation.
+        scope_conflicts = self._scope_exclusive_conflicts(conn) if policy["exclusivity"] == "scope" else []
+        conn.execute("DELETE FROM binding_conflicts")
+        conn.executemany("INSERT INTO binding_conflicts(identity,scope_kind,scope_id,kind,conflict_count,first_seen) VALUES(?,?,?,?,?,?)",
+                         [(row["identity"], row["scope_kind"], row["scope_id"], row["kind"], row["count"], time.time())
+                          for row in (*conflicts, *scope_conflicts)])
+        if not conflicts:
+            self._create_same_user_indexes(conn)
+        if policy["exclusivity"] == "scope" and not scope_conflicts:
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_romance_scope_uq ON relationship_bindings(scope_kind,scope_id) WHERE status='active' AND type_key IN ('romantic_partner','spouse')")
         else:
             conn.execute("DROP INDEX IF EXISTS idx_binding_romance_scope_uq")
-        conflicts = self._same_user_conflicts(conn)
-        conn.execute("DELETE FROM binding_conflicts")
-        conn.executemany("INSERT INTO binding_conflicts(identity,scope_kind,scope_id,kind,conflict_count,first_seen) VALUES(?,?,?,?,?,?)",
-                         [(row["identity"], row["scope_kind"], row["scope_id"], row["kind"], row["count"], time.time()) for row in conflicts])
-        if not conflicts:
-            self._create_same_user_indexes(conn)
         return {"exclusivity": policy["exclusivity"], "epoch": int(policy["epoch"]),
-                "legacy_conflicts": len(conflicts)}
+                "legacy_conflicts": len(conflicts) + len(scope_conflicts)}
 
     def activate_binding_policy(self, desired: dict[str, Any]) -> dict[str, Any]:
         """MIS-125 R2: activate the desired policy after a reload.
@@ -247,6 +256,17 @@ class RelationStore:
             conn.execute("BEGIN IMMEDIATE")
             current = self._active_policy_row(conn)
             self.policy_activation_error = None
+            # MIS-134 C03: a running restore holds the lease and will inject
+            # the CURRENT policy; an activation racing it could be clobbered
+            # by the final copy. Refuse while the lease is valid (desired is
+            # kept; ordinary chat is unaffected).
+            if self._restore_lease_active(conn):
+                self.policy_activation_error = {"message": "恢复正在进行中，请稍后重载激活", "conflict_scopes": 0}
+                conn.execute("ROLLBACK")
+                row = self._active_policy_row(conn)
+                return {"activated": False, "reason": "restore_in_progress", **self.policy_activation_error,
+                        "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
+                                      "epoch": int(row["epoch"])}}
             if wanted_exclusivity == "scope" and current["exclusivity"] != "scope":
                 clash_count = int(conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
                 if clash_count:
@@ -279,8 +299,23 @@ class RelationStore:
 
     @staticmethod
     def _same_user_conflicts(conn) -> list[dict[str, Any]]:
-        rows = conn.execute("SELECT identity,scope_kind,scope_id,'identity_type' AS kind,COUNT(*) AS count FROM relationship_bindings WHERE status='active' GROUP BY identity,scope_kind,scope_id,type_key HAVING COUNT(*)>1 UNION ALL SELECT identity,scope_kind,scope_id,'identity_romance' AS kind,COUNT(*) AS count FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY identity,scope_kind,scope_id HAVING COUNT(*)>1").fetchall()
+        # MIS-134 C04: the diagnosis key carries the concrete type, so two
+        # duplicated types for one identity are two distinct diagnostic rows
+        # instead of a primary-key collision.
+        rows = conn.execute("SELECT identity,scope_kind,scope_id,'identity_type:'||type_key AS kind,COUNT(*) AS count FROM relationship_bindings WHERE status='active' GROUP BY identity,scope_kind,scope_id,type_key HAVING COUNT(*)>1 UNION ALL SELECT identity,scope_kind,scope_id,'identity_romance' AS kind,COUNT(*) AS count FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY identity,scope_kind,scope_id HAVING COUNT(*)>1").fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _scope_exclusive_conflicts(conn) -> list[dict[str, Any]]:
+        """MIS-134 C02: scopes violating the cross-user romance uniqueness —
+        several users holding romance bindings, or one user holding two tiers
+        (both violate the same scope-level index predicate). Recorded with an
+        empty identity placeholder; they block new romance writes in that
+        scope until an administrator ends the extra bindings by exact
+        binding_id."""
+        rows = conn.execute("SELECT scope_kind,scope_id,COUNT(*) AS rows_count,COUNT(DISTINCT identity) AS users FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(*)>1").fetchall()
+        return [{"identity": "", "scope_kind": row["scope_kind"], "scope_id": row["scope_id"],
+                 "kind": "scope_exclusive", "count": int(row["rows_count"])} for row in rows]
 
     @staticmethod
     def _create_same_user_indexes(conn) -> None:
@@ -291,15 +326,24 @@ class RelationStore:
         with self.lock, self._connection() as conn:
             return int(conn.execute("SELECT COUNT(*) FROM binding_conflicts").fetchone()[0])
 
-    def _legacy_conflict_exists(self, conn, identity: str, scope_kind: str, scope_id: str) -> bool:
-        return bool(conn.execute("SELECT 1 FROM binding_conflicts WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, scope_kind, scope_id)).fetchone())
+    def _legacy_conflict_exists(self, conn, identity: str, scope_kind: str, scope_id: str, is_romance: bool = False) -> bool:
+        """MIS-134 C02: identity-level conflicts always block; a scope-level
+        multi-user romance conflict additionally blocks new romance writes in
+        that scope (friend/partner tiers keep working there)."""
+        if conn.execute("SELECT 1 FROM binding_conflicts WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, scope_kind, scope_id)).fetchone():
+            return True
+        if is_romance and conn.execute("SELECT 1 FROM binding_conflicts WHERE identity='' AND scope_kind=? AND scope_id=? AND kind='scope_exclusive' LIMIT 1", (scope_kind, scope_id)).fetchone():
+            return True
+        return False
 
-    def _admit_binding(self, conn, binding: dict[str, Any] | None, identity: str, scope_kind: str, scope_id: str, active_policy: sqlite3.Row, expected_epoch: int | None, allow_romance_replace: bool = False) -> tuple[dict[str, Any] | None, str]:
+    def _admit_binding(self, conn, binding: dict[str, Any] | None, identity: str, scope_kind: str, scope_id: str, active_policy: sqlite3.Row, expected_epoch: int | None, allow_romance_replace: bool = False, now: float | None = None) -> tuple[dict[str, Any] | None, str]:
         """MIS-125 R2: shared in-transaction admission ladder for every
         binding write path (settlement, store primitive, legacy migration).
         Order: legacy conflicts -> stale policy epoch -> cross-user romance
         exclusion (active policy only) -> same-user romance level -> same-type
-        duplicate. Returns (binding_or_None, status).
+        duplicate -> optional rebind cooldown (MIS-134 C06: the cooldown is
+        part of the ladder, so no write path can bypass it; ends carrying the
+        upgraded marker never seed one). Returns (binding_or_None, status).
 
         ``allow_romance_replace`` (MIS-126 R3) marks the one legitimate
         romance-tier transition: the backend-recognised upgrade of the
@@ -307,12 +351,12 @@ class RelationStore:
         change stays rejected."""
         if binding is None:
             return None, "no_binding"
-        if self._legacy_conflict_exists(conn, identity, scope_kind, scope_id):
+        rel_type = get_type(binding["type_key"])
+        is_romance = bool(rel_type and rel_type.category == "romance")
+        if self._legacy_conflict_exists(conn, identity, scope_kind, scope_id, is_romance):
             return None, "binding_rejected:legacy_conflict"
         if expected_epoch is not None and int(expected_epoch) != int(active_policy["epoch"]):
             return None, "binding_rejected:policy_changed"
-        rel_type = get_type(binding["type_key"])
-        is_romance = bool(rel_type and rel_type.category == "romance")
         if is_romance and active_policy["exclusivity"] == "scope":
             if conn.execute("SELECT 1 FROM relationship_bindings WHERE scope_kind=? AND scope_id=? AND status='active' AND type_key IN ('romantic_partner','spouse') AND identity<>? LIMIT 1", (scope_kind, scope_id, identity)).fetchone():
                 return None, "binding_rejected:exclusive"
@@ -322,6 +366,16 @@ class RelationStore:
             return None, "binding_rejected:romance_occupied"
         if conn.execute("SELECT 1 FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='active' LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone():
             return None, "binding_rejected:duplicate"
+        if active_policy["rebind_cooldown"] == "type_default":
+            # MIS-134 C06: cooldown counting from the latest REAL end of the
+            # same identity/type/scope (upgraded replacements are excluded);
+            # durations come from the single type directory.
+            current = time.time() if now is None else float(now)
+            cooldown_hours = int(get_type(binding["type_key"]).cooldown_hours)
+            last_ended = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='ended' AND (end_reason IS NULL OR end_reason<>'upgraded') ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone()
+            if (cooldown_hours > 0 and last_ended is not None and last_ended["ended_at"] is not None
+                    and current - float(last_ended["ended_at"]) < cooldown_hours * 3600):
+                return None, "binding_rejected:cooldown"
         return binding, "binding_admitted"
 
     def _default_values(self) -> dict[str, int]:
@@ -592,7 +646,7 @@ class RelationStore:
             now=time.time()
             if binding:
                 active_policy=self._active_policy_row(conn)
-                binding,admission=self._admit_binding(conn,binding,identity,scope_kind,scope_id,active_policy,expected_epoch)
+                binding,admission=self._admit_binding(conn,binding,identity,scope_kind,scope_id,active_policy,expected_epoch,now=now)
                 binding_status="binding_created" if binding is not None else admission
                 if binding is None:
                     notes={**notes,"binding":{"notes":[admission]}}
@@ -689,7 +743,11 @@ class RelationStore:
                     applied_value = capped
                 applied[dimension] = applied_value
                 notes[dimension] = {"requested": requested, "repeat_factor": result.repeat_factor, "notes": result_notes, "window_positive": already_positive}
-            projected = {key: max(0, min(1000, values.get(key, 0) + applied.get(key, 0))) for key in DIMENSIONS}
+            # MIS-134 C05: a paused account never writes the accepted deltas,
+            # so binding/upgrade qualification uses the values that will
+            # actually exist after this turn — unapplied scores can never
+            # carry a proposal across a threshold.
+            projected = {key: max(0, min(1000, values.get(key, 0) + (0 if paused else applied.get(key, 0)))) for key in DIMENSIONS}
             binding, binding_reason = binding_gate(projected, final_state)
             binding_status = "no_binding"
             if binding is None and binding_reason != "no_proposal":
@@ -717,54 +775,42 @@ class RelationStore:
                 own_partner = conn.execute("SELECT binding_id FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key='romantic_partner' AND status='active' LIMIT 1", (identity, scope_kind, scope_id)).fetchone()
                 upgrade_of = own_partner["binding_id"] if own_partner else None
             if binding:
-                binding, admission = self._admit_binding(conn, binding, identity, scope_kind, scope_id, active_policy, policy.get("expected_epoch"), allow_romance_replace=upgrade_of is not None)
+                binding, admission = self._admit_binding(conn, binding, identity, scope_kind, scope_id, active_policy, policy.get("expected_epoch"), allow_romance_replace=upgrade_of is not None, now=now)
                 if binding is None:
                     binding_status = admission
                     notes = {**notes, "binding": {"notes": [admission]}}
                 elif upgrade_of:
-                    # Upgrade: the target type's REAL cooldown still applies
-                    # when the policy enables it - an ended-spouse record
-                    # within its window rejects the upgrade and keeps the
-                    # current partner untouched.
-                    if active_policy["rebind_cooldown"] == "type_default":
-                        cooldown_hours = int((policy.get("type_cooldown_hours") or {}).get("spouse", 0))
-                        last_real = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key='spouse' AND status='ended' AND (end_reason IS NULL OR end_reason<>'upgraded') ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id)).fetchone()
-                        if (cooldown_hours > 0 and last_real is not None and last_real["ended_at"] is not None
-                                and now - float(last_real["ended_at"]) < cooldown_hours * 3600):
-                            binding = None
-                            notes = {**notes, "binding": {"notes": ["binding_rejected:cooldown"]}}
-                            binding_status = "binding_rejected:cooldown"
-                    if binding is not None:
-                        # Atomic replacement: the partner row ends with the
-                        # explicit upgraded marker (never a breakup, never a
-                        # cooldown seed) and links forward to the new binding.
-                        conn.execute("UPDATE relationship_bindings SET status='ended',ended_at=?,updated_at=?,end_reason='upgraded',state_json=json_set(state_json,'$.upgraded_to',?) WHERE binding_id=?", (now, now, binding["binding_id"], upgrade_of))
-                        binding_status = "binding_upgraded"
-                        notes = {**notes, "binding": {"notes": ["binding_upgraded:romantic_partner->spouse"], "upgraded_from": upgrade_of}}
-                elif active_policy["rebind_cooldown"] == "type_default":
-                    # MIS-94: type cooldown counts from the latest ended_at of
-                    # the same identity/type/scope; ended history is kept and
-                    # only the most recent one decides. Durations come from the
-                    # caller's single type directory via policy. Ends carrying
-                    # the upgraded marker were replacements, not breakups, and
-                    # never seed a cooldown (R3).
-                    cooldown_hours = int((policy.get("type_cooldown_hours") or {}).get(binding["type_key"], 0))
-                    last_ended = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='ended' AND (end_reason IS NULL OR end_reason<>'upgraded') ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone()
-                    if (cooldown_hours > 0 and last_ended is not None and last_ended["ended_at"] is not None
-                            and now - float(last_ended["ended_at"]) < cooldown_hours * 3600):
-                        binding = None
-                        notes = {**notes, "binding": {"notes": ["binding_rejected:cooldown"]}}
-                        binding_status = "binding_rejected:cooldown"
-                    else:
-                        binding_status = "binding_created"
+                    # MIS-126 R3: atomic replacement — the partner row ends
+                    # with the explicit upgraded marker (never a breakup,
+                    # never a cooldown seed) and links forward to the new
+                    # binding; the target type's real cooldown was already
+                    # enforced inside the shared admission ladder.
+                    conn.execute("UPDATE relationship_bindings SET status='ended',ended_at=?,updated_at=?,end_reason='upgraded',state_json=json_set(state_json,'$.upgraded_to',?) WHERE binding_id=?", (now, now, binding["binding_id"], upgrade_of))
+                    binding_status = "binding_upgraded"
+                    notes = {**notes, "binding": {"notes": ["binding_upgraded:romantic_partner->spouse"], "upgraded_from": upgrade_of}}
                 else:
                     binding_status = "binding_created"
+                    notes = {**notes, "binding": {"notes": ["binding_created:" + binding["type_key"]]}}
             if not paused:
                 for key, delta in applied.items():
                     if key in DIMENSIONS:
                         values[key] = clamp(values.get(key, 0) + int(delta))
             conn.execute("INSERT INTO accounts(identity,scope_kind,scope_id,values_json,paused,revision,updated_at,state_json,last_interaction) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(identity,scope_kind,scope_id) DO UPDATE SET values_json=excluded.values_json,revision=excluded.revision,updated_at=excluded.updated_at,state_json=excluded.state_json,last_interaction=excluded.last_interaction", (identity, scope_kind, scope_id, json.dumps(values), int(paused), revision + 1, now, json.dumps(base_state), now))
-            conn.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, identity, scope_kind, scope_id, source_kind, evidence[:300], reason[:500], json.dumps(requested_all), json.dumps(applied), json.dumps(notes), "llm", now))
+            # MIS-134 C05: the event audit records the ACTUAL deltas — a
+            # paused account wrote nothing, so the accepted-but-unapplied
+            # deltas move into the notes with an explicit marker.
+            event_actor = "llm"
+            event_applied = applied
+            if paused and any(applied.values()):
+                notes = {**notes, "paused": {"accepted": dict(applied)}}
+                event_applied = {}
+            # MIS-134 C07: a round with no score, no safety action and a
+            # rejected binding is a pure rejection receipt — kept for replay
+            # idempotency and explanation, but never counted as a successful
+            # settlement (blacklist counters and policy windows filter it).
+            if not any((event_applied or {}).values()) and binding is None and timed_safety is None:
+                event_actor = "llm_receipt"
+            conn.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (event_id, identity, scope_kind, scope_id, source_kind, evidence[:300], reason[:500], json.dumps(requested_all), json.dumps(event_applied), json.dumps(notes), event_actor, now))
             if timed_safety is not None:
                 previous = conn.execute("SELECT generation FROM timed_safety WHERE identity=? AND scope_kind=? AND scope_id=?", (identity, scope_kind, scope_id)).fetchone()
                 generation = int(previous["generation"]) + 1 if previous else 1
@@ -929,13 +975,11 @@ class RelationStore:
                 return False
             now=time.time()
             conn.execute("UPDATE relationship_bindings SET status='ended',ended_at=?,updated_at=?,end_reason=?,state_json=json_set(state_json,'$.end_actor',?,'$.end_reason',?) WHERE binding_id=?",(now,now,reason_code[:64],actor[:64],reason_code[:64],binding_id))
-            conflicts=self._same_user_conflicts(conn)
-            conn.execute("DELETE FROM binding_conflicts WHERE identity=? AND scope_kind=? AND scope_id=?",(row["identity"],row["scope_kind"],row["scope_id"]))
-            conn.executemany("INSERT INTO binding_conflicts(identity,scope_kind,scope_id,kind,conflict_count,first_seen) VALUES(?,?,?,?,?,?)",
-                             [(c["identity"],c["scope_kind"],c["scope_id"],c["kind"],c["count"],time.time()) for c in conflicts
-                              if c["identity"]==row["identity"] and c["scope_kind"]==row["scope_kind"] and c["scope_id"]==row["scope_id"]])
-            if not conflicts:
-                self._create_same_user_indexes(conn)
+            # MIS-134 C02: one full reconciliation in the same transaction —
+            # the recount covers same-user AND scope-level conflicts, the
+            # diagnosis table is refreshed, and once the ledger is clean every
+            # applicable constraint index comes back (writes resume).
+            self._reconcile_binding_constraints(conn)
             conn.commit()
             return True
 
@@ -971,12 +1015,12 @@ class RelationStore:
                 conn.execute("ROLLBACK")
                 return "already_migrated"
             active_policy=self._active_policy_row(conn)
+            now=time.time()
             candidate={"binding_id":binding_id,"type_key":type_key,"unique_scope":"romance","origin":"legacy_confirmed_migration","summary":""}
-            candidate,status=self._admit_binding(conn,candidate,identity,scope_kind,scope_id,active_policy,None)
+            candidate,status=self._admit_binding(conn,candidate,identity,scope_kind,scope_id,active_policy,None,now=now)
             if candidate is None:
                 conn.execute("ROLLBACK")
                 return status
-            now=time.time()
             conn.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at) VALUES(?,?,?,?,?,'active','romance','legacy_confirmed_migration',?,?,?,NULL)",(binding_id,identity,scope_kind,scope_id,type_key,json.dumps({"origin":"legacy_confirmed_migration","display":"此生挚爱"}),now,now))
             return "migrated"
 
@@ -1199,17 +1243,22 @@ class RelationStore:
         return cleaned
 
     def restore_backup(self, name: str, kind: str = "manual") -> dict[str, Any]:
-        """MIS-95/MIS-117: prechecked restore via the SQLite backup API.
+        """MIS-95/MIS-117/MIS-134: prechecked restore via the SQLite backup API.
 
         The source must pass an integrity check and carry a supported schema
         version (1..SCHEMA_VERSION) or it is rejected before the live database
-        is touched. An older-schema backup is first migrated on a temporary
-        staging copy (shared idempotent schema bring-up, migration log, version
-        stamp with read-back verification, then an integrity check); only a
-        fully verified staging copy replaces the live database, and the
-        protected pre_restore snapshot is taken right before that final copy.
-        Any earlier failure therefore leaves the live database exactly as it
-        was, and a restored copy always ends at the current schema."""
+        is touched. An older-schema backup is first migrated on a PRIVATE
+        staging copy (unique per-call file name — concurrent restores can no
+        longer delete each other's staging). The final phase runs under a
+        cross-instance restore lease: the lease is mutually exclusive with
+        policy activation, so the policy captured inside the lease is stable;
+        the staging copy is injected with that policy plus a brand-new epoch,
+        verified, and only then copied into the live database through a
+        read-only source handle (a missing source can never spawn an empty
+        database). After the copy the live facts are verified against the
+        return value; any failure — including a detected clobber — rolls the
+        live database back to the pre_restore snapshot taken moments earlier
+        and raises instead of faking success."""
         if kind not in BACKUP_KINDS: raise ValueError("unknown backup kind")
         source=(self.backup_dir/kind/Path(name).name).resolve(); parent=(self.backup_dir/kind).resolve()
         if source.parent != parent or not source.is_file(): raise ValueError("backup not found")
@@ -1226,34 +1275,31 @@ class RelationStore:
             raise ValueError(f"backup failed integrity check: {integrity}")
         if not 1 <= version <= SCHEMA_VERSION:
             raise ValueError(f"unsupported backup schema version {version}; this build supports 1..{SCHEMA_VERSION}")
-        staging=source.with_name(source.stem + ".restoring.tmp")
-        live_policy=self.active_binding_policy()
+        import uuid
+        staging=source.with_name(source.stem + f".restoring-{uuid.uuid4().hex[:12]}.tmp")
+        if not self._acquire_restore_lease(ttl_seconds=60):
+            raise ValueError("another restore is in progress; retry after it finishes")
         try:
             self._materialize_staging(source, staging)
             self._migrate_staging(staging, from_version=version, backup_name=source.name)
-            # MIS-125 R2: the restored copy adopts the CURRENT effective
-            # policy with a brand-new epoch. The backup's own baked-in indexes
-            # and epoch are discarded - an old backup must never re-lock
-            # relationships that the active policy has released. All
-            # structural and policy writes stay on the staging copy (MIS-121
-            # B02: the final live copy is followed by zero structural writes).
-            staging_conn=sqlite3.connect(staging, timeout=10)
-            staging_conn.row_factory=sqlite3.Row
-            try:
-                staging_conn.execute("BEGIN IMMEDIATE")
-                staging_conn.execute("INSERT OR REPLACE INTO binding_policy(id,exclusivity,rebind_cooldown,epoch,updated_at) VALUES(1,?,?,?,?)",
-                                     (live_policy["exclusivity"], live_policy["rebind_cooldown"], int(live_policy["epoch"]) + 1, time.time()))
-                if live_policy["exclusivity"] == "scope":
-                    clash_count=int(staging_conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
-                    if clash_count:
-                        raise ValueError(f"restored backup conflicts with the active exclusivity policy in {clash_count} scope(s); end the extra bindings from a backup-era instance or restore while exclusivity is off")
-                summary=self._reconcile_binding_constraints(staging_conn)
-                staging_conn.commit()
-            finally:
-                staging_conn.close()
+            # Inside the lease the effective policy cannot be changed by an
+            # activation (they are mutually exclusive), so this snapshot of
+            # the live policy is authoritative for the whole final phase.
+            live_policy=self.active_binding_policy()
+            summary=self._inject_staging_policy(staging, live_policy)
             self._verify_staging(staging)
             self.backup_now("pre_restore")
-            self._copy_into_live(staging)
+            try:
+                self._copy_into_live(staging)
+                self._verify_restored_live(live_policy)
+            except Exception:
+                # The live database was replaced but does not match the
+                # verified staging (or the copy itself failed): roll back to
+                # the pre-restore snapshot instead of faking success.
+                pre_restore=max((self.backup_dir/"pre_restore").glob("*.sqlite3"), key=lambda p: p.stat().st_mtime, default=None)
+                if pre_restore is not None:
+                    self._copy_into_live(pre_restore)
+                raise
             self.policy_activation_error=None
             return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
                     "integrity": "ok", "migrated": version < SCHEMA_VERSION,
@@ -1262,7 +1308,74 @@ class RelationStore:
                                "epoch": int(live_policy["epoch"]) + 1,
                                "legacy_conflicts": summary["legacy_conflicts"]}}
         finally:
+            self._release_restore_lease()
             staging.unlink(missing_ok=True)
+
+    def _inject_staging_policy(self, staging: Path, live_policy: dict[str, Any]) -> dict[str, Any]:
+        """MIS-134 C01/C03: adopt the CURRENT effective policy with a
+        brand-new epoch on the staging copy and reconcile its constraints.
+        The backup's own baked-in indexes and epoch are discarded — an old
+        backup must never re-lock relationships that the active policy has
+        released. All structural and policy writes stay on staging (MIS-121
+        B02: the final live copy is followed by zero structural writes)."""
+        staging_conn=sqlite3.connect(staging, timeout=10)
+        staging_conn.row_factory=sqlite3.Row
+        try:
+            staging_conn.execute("BEGIN IMMEDIATE")
+            staging_conn.execute("INSERT OR REPLACE INTO binding_policy(id,exclusivity,rebind_cooldown,epoch,updated_at) VALUES(1,?,?,?,?)",
+                                 (live_policy["exclusivity"], live_policy["rebind_cooldown"], int(live_policy["epoch"]) + 1, time.time()))
+            summary=self._reconcile_binding_constraints(staging_conn)
+            if live_policy["exclusivity"] == "scope":
+                clash_count=int(staging_conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
+                if clash_count:
+                    raise ValueError(f"restored backup conflicts with the active exclusivity policy in {clash_count} scope(s); end the extra bindings from a backup-era instance or restore while exclusivity is off")
+            staging_conn.commit()
+        except Exception:
+            staging_conn.rollback()
+            raise
+        finally:
+            staging_conn.close()
+        return summary
+
+    def _acquire_restore_lease(self, ttl_seconds: int) -> bool:
+        """MIS-134 C01/C03: cross-instance mutual exclusion for the restore
+        final phase. The lease expires (a crashed restore never blocks
+        forever) and policy activation honours it while it is valid."""
+        with self.lock, self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row=conn.execute("SELECT until FROM restore_lease WHERE id=1").fetchone()
+            if row is not None and float(row["until"]) > time.time():
+                conn.execute("ROLLBACK")
+                return False
+            conn.execute("INSERT OR REPLACE INTO restore_lease(id,until,owner) VALUES(1,?,?)",
+                         (time.time() + max(1, ttl_seconds), uuid.uuid4().hex[:12]))
+        return True
+
+    def _release_restore_lease(self) -> None:
+        with self.lock, self._connection() as conn:
+            conn.execute("DELETE FROM restore_lease WHERE id=1")
+
+    def _restore_lease_active(self, conn) -> bool:
+        row=conn.execute("SELECT until FROM restore_lease WHERE id=1").fetchone()
+        return bool(row) and float(row["until"]) > time.time()
+
+    def _verify_restored_live(self, live_policy: dict[str, Any]) -> None:
+        """MIS-134 C01/C03: the live database must match the verified staging
+        facts after the copy; a mismatch means a concurrent writer clobbered
+        the restore and is raised (the caller rolls back pre_restore)."""
+        conn=sqlite3.connect(self.path, timeout=10)
+        conn.row_factory=sqlite3.Row
+        try:
+            version=int(conn.execute("PRAGMA user_version").fetchone()[0])
+            integrity=conn.execute("PRAGMA integrity_check").fetchone()[0]
+            row=conn.execute("SELECT exclusivity,rebind_cooldown,epoch FROM binding_policy WHERE id=1").fetchone()
+        finally:
+            conn.close()
+        if version != SCHEMA_VERSION or integrity != "ok" or row is None:
+            raise RuntimeError("restored live database failed post-copy verification")
+        if (row["exclusivity"], row["rebind_cooldown"], int(row["epoch"])) != (
+                live_policy["exclusivity"], live_policy["rebind_cooldown"], int(live_policy["epoch"]) + 1):
+            raise RuntimeError("restored live database was clobbered by a concurrent policy change")
 
     def _materialize_staging(self, source: Path, staging: Path) -> None:
         """Copy the verified backup file onto a staging path via the backup API."""
@@ -1301,10 +1414,16 @@ class RelationStore:
             raise ValueError(f"migrated restore staging copy has unexpected schema version {version}")
 
     def _copy_into_live(self, source: Path) -> None:
-        """Page-by-page copy from a backup file into the live database."""
+        """Page-by-page copy from a backup file into the live database.
+
+        MIS-134 C01: the source is opened read-only through a URI after an
+        explicit existence check — a missing or deleted source can never
+        silently spawn an empty database and get copied over the live data."""
+        if not source.is_file():
+            raise ValueError(f"restore source disappeared before the final copy: {source.name}")
         with self.lock:
             target=sqlite3.connect(self.path, timeout=10)
-            source_conn=sqlite3.connect(source)
+            source_conn=sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)
             try:
                 source_conn.backup(target)
             finally:

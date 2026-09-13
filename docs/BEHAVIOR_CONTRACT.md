@@ -52,7 +52,7 @@
 - **输入**: v3 relationship_proposal action=bind type_id=friend origin=mutual_dialogue mutuality=clear（无分数变化轮）
 - **输出**: binding_created; active_bindings=['friend']
 - **同轮重复提案**: 第二次相同 bind → binding_rejected:duplicate（排他/唯一性保留，账本仍一行）
-- **重放输出**: null（duplicate_event 幂等，不产生第二条绑定）
+- **重放输出**: {"notes": ["binding_created:friend"]}（duplicate_event 幂等，不产生第二条绑定；MIS-134 C08 起建立/升级/拒绝结果写入审计 notes，该行为建立轮的注释）
 - **反例输入**: mutuality=insufficient 且 trust 400+3<500 阈值
 - **反例输出**: no binding; binding note={"notes": ["binding_rejected:mutuality"]}（分数达标≠绑定，双向明确才自动绑定）
 

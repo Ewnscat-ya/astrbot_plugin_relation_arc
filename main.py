@@ -522,12 +522,14 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             logger.info("[关系弧线] settlement=zero_after_policy binding=%s", info.get("binding_reason"))
             return
         binding_status = info.get("status", "no_binding")
-        self._record_health("applied", text_source, parsed)
+        # MIS-134 C07: a pure rejection receipt is never reported as applied.
+        settlement_outcome = "binding_rejected" if str(binding_status).startswith("binding_rejected") else "applied"
+        self._record_health(settlement_outcome, text_source, parsed)
         blacklist=self.config.get("auto_blacklist",{})
         if blacklist.get("enabled") and self.store.settlement_event_count(identity,scope_kind,scope_id) >= int(blacklist["settlement_limit"]):
             self.store.blacklist_settlement(identity,scope_kind,scope_id,"settlement_limit")
             logger.info("[关系弧线] settlement=blacklist_added")
-        logger.info("[关系弧线] settlement=applied dimensions=%s binding=%s", ",".join(sorted(key for key,value in info.get("applied", {}).items() if value)), binding_status)
+        logger.info("[关系弧线] settlement=%s dimensions=%s binding=%s", settlement_outcome, ",".join(sorted(key for key,value in info.get("applied", {}).items() if value)), binding_status)
 
 
     # MIS-117: decorated chat entries live in this class body. The host
@@ -751,6 +753,7 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         romance_visible = (not is_group) and self._romance_eligible(values, state)
         show_reason = not is_group
         lines = ["【近期关系记录】"]
+        tier_label = {"romantic_partner": "恋人", "spouse": "此生挚爱"}
         for row in rows:
             changes = json.loads(row["applied_json"])
             shown = "、".join(
@@ -758,7 +761,24 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                 for key, change in changes.items()
                 if change and (key != "romance_interest" or romance_visible))
             suffix = f"：{row['reason']}" if show_reason and row.get("reason") else ""
-            lines.append(f"- {shown or '无变化'}{suffix}")
+            # MIS-134 C08: the relationship outcome of the turn is part of the
+            # record, not just the score. Romance tier names follow the same
+            # hiding policy as the rest of the romance state.
+            binding_result = ""
+            try:
+                binding_notes = (json.loads(row["notes_json"]).get("binding") or {}).get("notes", [])
+            except (ValueError, TypeError):
+                binding_notes = []
+            for note in binding_notes:
+                if note == "binding_upgraded:romantic_partner->spouse":
+                    binding_result = "；正式关系已升级" + ("：恋人 → 此生挚爱" if romance_visible else "")
+                elif note == "binding_created:spouse":
+                    binding_result = "；正式关系建立" + ("：此生挚爱" if romance_visible else "")
+                elif note == "binding_created:romantic_partner":
+                    binding_result = "；正式关系建立" + ("：恋人" if romance_visible else "")
+                elif note.startswith("binding_rejected:"):
+                    binding_result = "；关系提案未通过（" + note.split(":", 1)[1] + "）"
+            lines.append(f"- {shown or '无变化'}{suffix}{binding_result}")
         yield event.plain_result("\n".join(lines))
     @filter.command("关系", alias={"关系状态"})
     async def relation(self, event: AstrMessageEvent):

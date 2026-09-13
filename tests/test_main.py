@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT.parent))
 
 from astrbot_plugin_relation_arc.main import RelationArc
 from astrbot_plugin_relation_arc.relation_engine import DEFAULT_VALUES
+from astrbot_plugin_relation_arc.relation_store import RelationStore
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.message.components import Image, Plain, Reply
@@ -1137,6 +1138,284 @@ class JudgeEpochPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
         await self.plugin.judge(event, FakeResponse(verdict))
         self.assertEqual(605, self.plugin.store.existing_account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+
+class PausedQualificationTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 C05: a paused account never writes the accepted deltas, so
+    binding/upgrade qualification uses the values that will actually exist —
+    unapplied scores can never carry a proposal across a threshold. An
+    already-qualified value still binds (no invented pause-freeze rule)."""
+
+    SPOUSE_READY = {"trust": 850, "respect": 750, "comfort": 850,
+                    "closeness": 850, "resonance": 750, "romance_interest": 850}
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.identity = "qq-adapter:user-1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def _prime(self, trust):
+        for key, value in self.SPOUSE_READY.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        self.plugin.store.set_dimension(self.identity, "global", "", "trust", trust)
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="shown", romance_state="eligible")
+
+    def _add_partner(self):
+        binding = {"binding_id": "partner-1", "type_key": "romantic_partner", "unique_scope": "romance",
+                   "origin": "test", "summary": ""}
+        status = self.plugin.store.apply_turn_with_binding(
+            event_id="evt-partner-1", identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding)[1]
+        self.assertEqual("binding_created", status)
+
+    async def test_unapplied_score_cannot_qualify_upgrade(self):
+        self._prime(trust=849)  # one below the spouse threshold
+        self._add_partner()
+        self.plugin.store.set_paused(self.identity, "global", "", True)
+        payload = {"schema_version": 3,
+                   "fact_effects": [{"effects": {"trust": 2}}],
+                   "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                             "origin": "mutual_dialogue", "mutuality": "clear",
+                                             "summary": "彼此确认"}}
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "paused-1"})()
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        bindings = {row["type_key"]: row for row in self.plugin.store.list_bindings()}
+        self.assertNotIn("spouse", bindings)
+        self.assertEqual("active", bindings["romantic_partner"]["status"])
+        # The real value never moved and the event audit reflects that.
+        self.assertEqual(849, self.plugin.store.existing_account(self.identity, "global", "")["values"]["trust"])
+        notes = json.loads(self.plugin.store.recent(self.identity, "global", "")[0]["notes_json"])
+        self.assertIn("binding_rejected:threshold", notes["binding"]["notes"])
+
+    async def test_already_qualified_value_binds_while_paused(self):
+        self._prime(trust=860)  # already past the threshold without new score
+        self._add_partner()
+        self.plugin.store.set_paused(self.identity, "global", "", True)
+        payload = {"schema_version": 3, "fact_effects": [{"effects": {"trust": 2}}],
+                   "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                             "origin": "mutual_dialogue", "mutuality": "clear",
+                                             "summary": "彼此确认"}}
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "paused-2"})()
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        bindings = {row["type_key"]: row for row in self.plugin.store.list_bindings()}
+        self.assertEqual("active", bindings["spouse"]["status"])
+        self.assertEqual("upgraded", bindings["romantic_partner"]["end_reason"])
+        self.assertEqual(860, self.plugin.store.existing_account(self.identity, "global", "")["values"]["trust"])
+        notes = json.loads(self.plugin.store.recent(self.identity, "global", "")[0]["notes_json"])
+        # 860 + 2 is edge-saturated to +1 (>=850 caps a positive delta).
+        self.assertEqual({"accepted": {"trust": 1}}, notes.get("paused"))
+
+
+class CooldownLadderTests(unittest.TestCase):
+    """MIS-134 C06: the rebind cooldown lives in the shared admission ladder,
+    so the legacy write primitive, the legacy migration and (via main) the
+    real startup migration all honour it — a reload can never silently
+    rebuild a just-ended relationship."""
+
+    def _store(self, directory: Path, cooldown: str) -> RelationStore:
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": cooldown}})
+        store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": cooldown})
+        return store
+
+    def _seed_ended_spouse(self, directory: Path, identity: str, hours_ago: float):
+        raw = sqlite3.connect(directory / "relation_arc.sqlite3")
+        raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES('old-spouse',?,'global','','spouse','ended','romance','seed','{}',1,1,?,'')",
+                    (identity, time.time() - hours_ago * 3600))
+        raw.commit()
+        raw.close()
+
+    def test_legacy_primitive_honours_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store(directory, "type_default")
+            self._seed_ended_spouse(directory, "qq:a", hours_ago=1)
+            binding = {"binding_id": "b1", "type_key": "spouse", "unique_scope": "romance",
+                       "origin": "test", "summary": ""}
+            status = store.apply_turn_with_binding(
+                event_id="e1", identity="qq:a", scope_kind="global", scope_id="",
+                source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding)[1]
+            self.assertEqual("binding_rejected:cooldown", status)
+
+    def test_legacy_migration_honours_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store(directory, "type_default")
+            self._seed_ended_spouse(directory, "qq:a", hours_ago=1)
+            status = store.migrate_confirmed_binding(identity="qq:a", scope_kind="global", scope_id="")
+            self.assertEqual("binding_rejected:cooldown", status)
+            # After the 336h window the same migration succeeds.
+            raw = sqlite3.connect(directory / "relation_arc.sqlite3")
+            raw.execute("UPDATE relationship_bindings SET ended_at=? WHERE binding_id='old-spouse'",
+                        (time.time() - 337 * 3600,))
+            raw.commit()
+            raw.close()
+            self.assertEqual("migrated", store.migrate_confirmed_binding(identity="qq:a", scope_kind="global", scope_id=""))
+
+    def test_cooldown_off_skips_for_every_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store(directory, "off")
+            self._seed_ended_spouse(directory, "qq:a", hours_ago=1)
+            binding = {"binding_id": "b1", "type_key": "spouse", "unique_scope": "romance",
+                       "origin": "test", "summary": ""}
+            self.assertEqual("binding_created",
+                             store.apply_turn_with_binding(
+                                 event_id="e1", identity="qq:a", scope_kind="global", scope_id="",
+                                 source_kind="test", evidence="", reason="", requested={}, applied={},
+                                 notes={}, binding=binding)[1])
+
+
+class RejectionReceiptTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 C07: a round with no score, no safety action and a rejected
+    binding is a pure rejection receipt — kept for replay idempotency, but
+    never counted by the auto blacklist and never reported as applied."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.plugin.config["auto_blacklist"] = {"enabled": True, "settlement_limit": 1}
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_policy_changed_receipt_does_not_blacklist(self):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "receipt-1"})()
+        self.plugin._pin_turn_context(event)
+        # The policy changes after injection: the friend proposal (still
+        # below threshold in fact terms is irrelevant — use a qualified
+        # account so ONLY the epoch gate rejects the binding).
+        self.plugin.store.set_dimension("qq-adapter:user-1", "global", "", "trust", 600)
+        # A REAL policy change: the epoch advances past the pinned turn.
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        payload = {"schema_version": 3, "fact_effects": [],
+                   "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                             "origin": "mutual_dialogue", "mutuality": "clear",
+                                             "summary": "s"}}
+        text = '<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'
+        await self.plugin.judge(event, FakeResponse(text))
+        identity = "qq-adapter:user-1"
+        # Empty effects: the qualified 600 value is untouched.
+        self.assertEqual(600, self.plugin.store.existing_account(identity, "global", "")["values"]["trust"])
+        self.assertEqual([], self.plugin.store.active_bindings_for(identity, "global", ""))
+        self.assertFalse(self.plugin.store.is_settlement_blacklisted(identity, "global", ""))
+        # The receipt row exists for idempotency, but as a receipt actor.
+        with self.plugin.store._connection() as conn:
+            row = conn.execute("SELECT actor FROM events WHERE identity=? ORDER BY created_at DESC LIMIT 1", (identity,)).fetchone()
+        self.assertEqual("llm_receipt", row["actor"])
+        # A replay does not score twice or double-count.
+        await self.plugin.judge(event, FakeResponse(text))
+        self.assertEqual(600, self.plugin.store.existing_account(identity, "global", "")["values"]["trust"])
+
+    async def test_real_scored_round_still_counts_for_blacklist(self):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "receipt-2"})()
+        payload = {"schema_version": 3, "fact_effects": [{"effects": {"trust": 4}}]}
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        identity = "qq-adapter:user-1"
+        self.assertEqual(404, self.plugin.store.existing_account(identity, "global", "")["values"]["trust"])
+        self.assertTrue(self.plugin.store.is_settlement_blacklisted(identity, "global", ""))
+
+
+class HistoryBindingDisplayTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 C08: the chat history renders the relationship outcome —
+    built / upgraded / rejected — without leaking hidden romance tier names
+    in a group."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.identity = "qq-adapter:user-1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _settle(self, event_id, payload):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": event_id})()
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+
+    async def test_upgrade_shown_in_private_history(self):
+        for key, value in {"trust": 850, "respect": 750, "comfort": 850,
+                           "closeness": 850, "resonance": 750, "romance_interest": 850}.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="shown", romance_state="eligible")
+        self.plugin.store.apply_turn_with_binding(
+            event_id="evt-p", identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={}, notes={},
+            binding={"binding_id": "partner-1", "type_key": "romantic_partner", "unique_scope": "romance",
+                     "origin": "test", "summary": ""})
+        await self._settle("up-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                                              "summary": "s"}})
+        text = "".join([item async for item in self.plugin.history(FakeEvent())])
+        self.assertIn("已升级", text)
+        self.assertIn("恋人 → 此生挚爱", text)
+
+    async def test_rejection_shown_and_group_hides_tier_name(self):
+        # Qualify so the gate passes and the rejection happens inside the
+        # settlement transaction: pin the turn (epoch 1), change the policy
+        # (epoch 2), then settle the pinned turn — a real receipt round.
+        self.plugin.store.set_dimension(self.identity, "global", "", "trust", 600)
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "rej-1"})()
+        self.plugin._pin_turn_context(event)
+        # A REAL policy change so the pinned epoch goes stale.
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        payload = {"schema_version": 3, "fact_effects": [],
+                   "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                             "origin": "user_request", "mutuality": "clear",
+                                             "summary": "s"}}
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        private_text = "".join([item async for item in self.plugin.history(FakeEvent(user_id="user-1"))])
+        self.assertIn("关系提案未通过", private_text)
+        # In a group the same record must not surface the hidden romance
+        # reasoning; the plain rejection marker is allowed.
+        group_event = FakeEvent(group_id="group-1", wake=True, outline="[At:bot-1] hi")
+        group_event.message_obj = type("Message", (), {"message_id": "gh-1"})()
+        group_text = await self.plugin.history(group_event).__anext__()
+        self.assertNotIn("恋人", group_text)
+        self.assertNotIn("此生挚爱", group_text)
+
+
+class ConfigSourceWriteGuardTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 C09: binding_policy_source is produced by the migration and by
+    actual changes only — a client can never rewrite the provenance labels."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_client_cannot_overwrite_source(self):
+        from quart import Quart
+        # Make the current values explicit admin choices first.
+        self.plugin.config_mgr.update({"binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"}})
+        self.assertEqual("admin", self.plugin.config["binding_policy_source"]["exclusivity"])
+        app = Quart("source-guard")
+        async with app.test_request_context("/config", method="POST", json={
+                "binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"},
+                "binding_policy_source": {"exclusivity": "default", "rebind_cooldown": "default"}}):
+            response = await self.plugin._api_config()
+        self.assertEqual(200, response.status_code)
+        self.assertEqual({"exclusivity": "admin", "rebind_cooldown": "admin"},
+                         self.plugin.config["binding_policy_source"])
 
 
 class BoundaryProtocolTests(unittest.IsolatedAsyncioTestCase):
