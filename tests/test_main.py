@@ -780,6 +780,49 @@ class RichChainStripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
 
 
+class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-117: repeat decay must key on the first fact's evidence (baseline
+    semantics) with the signature fallback when evidence is omitted. Keying on
+    the joined audit summary silently disabled multi-fact decay."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _four_identical_turns(self, include_evidence: bool):
+        facts = [{"effects": {"trust": 10}}, {"effects": {"respect": 2}}]
+        if include_evidence:
+            facts[0]["evidence"] = "first fact"
+            facts[1]["evidence"] = "second fact"
+        text = ('<relation_judgment>' + json.dumps({"schema_version": 3, "fact_effects": facts})
+                + '</relation_judgment>好的。')
+        deltas, current = [], 400
+        for index in range(4):
+            event = FakeEvent()
+            event.message_obj = type("Message", (), {"message_id": f"repeat-{index}"})()
+            await self.plugin.judge(event, FakeResponse(text))
+            account = self.plugin.store.existing_account("qq-adapter:user-1", "global", "")
+            deltas.append(account["values"]["trust"] - current)
+            current = account["values"]["trust"]
+        return deltas, current
+
+    async def test_repeated_multi_fact_turns_decay_with_evidence(self):
+        deltas, final = await self._four_identical_turns(include_evidence=True)
+        # Default repeat factors for identical repeats: 1.0, 0.6, 0.3, 0.0.
+        self.assertEqual([10, 6, 3, 0], deltas)
+        self.assertEqual(419, final)
+
+    async def test_repeated_multi_fact_turns_decay_without_evidence(self):
+        deltas, final = await self._four_identical_turns(include_evidence=False)
+        self.assertEqual([10, 6, 3, 0], deltas)
+        self.assertEqual(419, final)
+
+
 class SettlementHealthTests(unittest.IsolatedAsyncioTestCase):
     """MIS-92: replays are recorded as duplicate, never as applied success."""
 

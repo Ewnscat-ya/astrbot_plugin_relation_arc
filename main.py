@@ -493,6 +493,7 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             evidence=" | ".join(item["evidence"] for item in parsed.effects),
             reason=" | ".join(item["reason"] for item in parsed.effects),
             requested_all=requested_all, fact_signature=fact_signature,
+            repeat_key=parsed.effects[0]["evidence"] if parsed.effects else "",
             safety_proposal=safety_proposal,
             policy={
                 "repeat_window_minutes": self.config["repeat_window_minutes"],

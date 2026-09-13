@@ -443,7 +443,7 @@ class RelationStore:
                 conn.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at) VALUES(?,?,?,?,?,'active',?,?,?,?,?,NULL)",(binding["binding_id"],identity,scope_kind,scope_id,binding["type_key"],binding.get("unique_scope","") ,event_id,json.dumps({"origin":binding["origin"],"summary":binding.get("summary","")}),now,now))
             return values,binding_status
 
-    def settle_turn(self, *, event_id: str, identity: str, scope_kind: str, scope_id: str, source_kind: str, evidence: str, reason: str, requested_all: dict[str, int], fact_signature: str, safety_proposal: dict[str, Any] | None, policy: dict[str, Any], romance_gate, binding_gate) -> tuple[dict[str, int], str, dict[str, Any]]:
+    def settle_turn(self, *, event_id: str, identity: str, scope_kind: str, scope_id: str, source_kind: str, evidence: str, reason: str, requested_all: dict[str, int], fact_signature: str, repeat_key: str = "", safety_proposal: dict[str, Any] | None, policy: dict[str, Any], romance_gate, binding_gate) -> tuple[dict[str, int], str, dict[str, Any]]:
         """MIS-92: one controlled transaction for a full turn settlement.
 
         Read state -> policy/window/eligibility recomputation -> writes all
@@ -452,6 +452,12 @@ class RelationStore:
         caller via the two pure callbacks (no I/O inside):
           romance_gate(values, state) -> bool
           binding_gate(projected_values, state) -> (binding | None, reason)
+
+        ``evidence``/``reason`` are the audit summary for the event row;
+        ``repeat_key`` (MIS-117, restored baseline semantics: the first fact's
+        evidence) is what repeat-decay matching compares against window rows,
+        falling back to ``fact_signature`` when it is empty. Joining the audit
+        summary into the match key silently disabled multi-fact decay.
 
         Returns (values, status, info); status is one of
         committed / duplicate / noop. A duplicate returns before any write, so
@@ -506,7 +512,7 @@ class RelationStore:
                     notes[dimension] = {"requested": requested, "repeat_factor": 1.0, "notes": ("romance_locked",), "window_positive": 0}
                     applied[dimension] = 0
                     continue
-                repeat_count = self._window_repeat_count(window, repeat_since, dimension, evidence, fact_signature)
+                repeat_count = self._window_repeat_count(window, repeat_since, dimension, repeat_key, fact_signature)
                 result = apply_delta(values.get(dimension, 0), requested, repeat_count, policy["repeat_factors"], False)
                 ceiling = int(anti_farm.get("positive_change_ceiling", {}).get(dimension, 0))
                 already_positive = self._window_positive_total(window, farm_since, dimension)
