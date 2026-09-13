@@ -16,8 +16,8 @@
 | 项 | 值 | 说明 |
 |---|---|---|
 | 插件版本 | 0.1.0（metadata.yaml） | 版本号维持不变，是否随发布 bump 由维护者决定 |
-| 配置版本 | CONFIG_VERSION = 6 | `config_manager.py` |
-| 数据库版本 | SCHEMA_VERSION = 11（user_version） | `relation_store.py` |
+| 配置版本 | CONFIG_VERSION = 7 | `config_manager.py`；v6→v7 迁移绑定策略字段（受保护备份） |
+| 数据库版本 | SCHEMA_VERSION = 12（user_version） | `relation_store.py`；v11→v12 增加 binding_policy/binding_conflicts/end_reason，旧通用排他索引由策略化约束替代 |
 | 宿主要求 | astrbot >= 4.26（metadata 声明） | 实测 4.26.0 / 4.27.0 / 4.28.0 |
 | 运行时 | Python 3.12.10 + SQLite 3.49.1 | 交付验证环境 |
 | 代码结构 | main.py + prompts/commands/pages_api 三模块拆分 | MIS-100 |
@@ -64,8 +64,9 @@
 | 无宿主回归（系统 Python，无 astrbot 包） | 80/80 通过（core+p0） | `python -m unittest tests.test_core tests.test_p0` |
 | 行为合同冻结样例复核 | 六类样例关键值与 `BEHAVIOR_CONTRACT.md` 一致，无漂移 | `tools/behavior_contract_samples.py` 复跑 |
 | 外部复核缺陷修复轮（MIS-117） | 复核提出的 2 P1 + 7 P2 及补充 P1（bridge 参数契约）全部修复；复核协议脚本 4/4、存储脚本 2/2 转正通过；宿主注册链在 4.28.0 与 4.26.0 下限均为 16 处理器归属 / 14 命令可分发 | 提交 bf7ca20 / 8069867 / 92b74d5 / 42f8acb / 20be4d3 / 4bbf44b |
-| 复验待修 B01/B02（MIS-121） | B01 图文顺序回归修复（合并回退仅对内容差异触发）+ 复核边界脚本 13/13 正式移植；B02 排他索引移入暂存副本，复制后零结构写入，容量受限场景恢复完整成功、三个复制前故障点活库零变化 | 提交 88a6009 / 本轮 B02 提交 |
+| 复验待修 B01/B02（MIS-121） | B01 图文顺序回归修复（合并回退仅对内容差异触发）+ 复核边界脚本 13/13 正式移植；B02 排他索引移入暂存副本，复制后零结构写入，容量受限场景恢复完整成功、三个复制前故障点活库零变化 | 提交 88a6009 / 0eb5859 |
 | Pages 前端契约 | node 合成 DOM 驱动真实 `app.js`：纯 endpoint + 独立 params、去重含参数、翻页点击、配置冲突重建（12 断言） | `tests/pages_app_harness.mjs`、`tests/test_pages_js.py` |
+| 关系规则调整轮（MIS-123～128） | 可选排他/冷却、同人原子升级、精简注入全部交付；策略四组合、双连接并发、在途 epoch、legacy 冲突、恢复策略注入与 staging 故障均有自动测试 | 提交 9a1b370 / eb44163 / c64d57f / 7e5d09f / 84f945f |
 | 存储基准 | 固定种子基线数据 | `docs/PERFORMANCE_BASELINE.md`、`tools/benchmark_store.py` |
 | 复用决策 / 评估决策 | 文档化 | `docs/REUSE_DECISIONS.md`、`docs/EVALUATION_DECISIONS.md` |
 
@@ -75,7 +76,19 @@
 |---|---|---|
 | 真实宿主端到端验收（真实浏览器 + 真实消息平台 + 持久部署） | 本机无部署宿主环境，按验收纪律不降标为"已通过" | Linear `MIS-116` 承接（含三项列表页真实浏览器首次加载/翻页/筛选复核）；清单见 `docs/HOST_COMPATIBILITY.md` |
 
-## 6. 已知实现说明（非行为差异）
+## 6. 关系规则调整轮（MIS-123～MIS-128）交付说明
+
+本轮为**产品行为调整**（授权合同见 Linear《关系规则调整 · GLM 执行方案》）：
+
+- **新装默认**：跨用户恋爱排他关闭（exclusivity=none）、结束后同类型重绑冷却关闭（rebind_cooldown=off）。
+- **旧版升级**：v6 配置缺字段显式迁移为 scope/type_default（即上一版行为），来源记 legacy；已有显式选择、全部关系与历史保留。
+- **生效语义**：两项策略保存到 JSON 为 desired，重载插件后在数据库事务内激活为 effective（epoch 单调，不复用）；API/页面区分 desired/effective/pending/激活失败/来源；激活遇多人占用拒绝并保持原策略，普通聊天不受影响。
+- **同人升级**：恋人→此生挚爱为后端原子升级（旧记录 end_reason=upgraded，前后 ID 可回溯），不算分手、不触发恋人冷却；目标类型真实结束冷却仍约束升级；无恋人直接绑定 spouse 保留。
+- **恢复边界**：数据库恢复沿用当前有效策略+全新 epoch（旧备份索引/epoch 作废）；scope 策略下含多人冲突的备份在复制前拒绝；配置副本随备份保存但**不是**自动恢复能力——手工替换配置后按方案重载激活。
+- **回滚演练**：升级前成对备份（配置受保护备份 + migration 数据库快照，均自动生成且校验 manifest）；回滚=成对还原后运行 0eb5859 代码；旧版代码会拒绝 schema 12（预期守卫，SchemaVersionGuardTests 覆盖）。恢复到旧备份即回到该时点，不保留之后的新互动。
+- **自动验收**：见 §4 证据表（最终提交 241/241 双版本、96/96 无宿主）；真实宿主验收保留待办（MIS-128 实机部分、MIS-116）。
+
+## 7. 已知实现说明（非行为差异）
 
 - MIS-100 拆分后，`_api_bindings` 处理器仍位于 `main.py`（其余 7 个已入
   `pages_api.py` 的 Mixin）。注册经由 Mixin 的 `self._api_bindings` 动态绑定，

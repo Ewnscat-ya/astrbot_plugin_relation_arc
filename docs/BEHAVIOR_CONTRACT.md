@@ -130,3 +130,16 @@
 - **预算**：单块内容 >64KB 记 oversize 拒绝结算（仍剥离显示）；fact 条目 >64 只取前 64（记 truncated_items）；深嵌套由 RecursionError 防护。
 - **富消息链**：逐 Plain 部件独立清理、原位保留（图片/文本/引用顺序不变）；协议块跨部件分裂时回退"合并到首部件"（正确性优先）；禁用结算时清理照旧。
 - **流式**：结算与清理位于宿主最终响应 hook；早期片段泄漏需真实宿主验证（未覆盖，见 HOST_COMPATIBILITY.md）。
+
+## 附录四：绑定策略、同人升级与可选冷却（MIS-123～MIS-128，2026-09-13 生效）
+
+本附录是产品行为调整的决策记录（授权来源：Linear《关系规则调整 · 可选排他、同人升级与冷却策略（GLM 执行方案）》，基线 0eb5859，配置版本 6→7、数据库 11→12）。它**替代**旧合同中"强制跨用户排他、无开关冷却、不支持同人升级"的条目；其余全部条目继续有效。
+
+- **绑定策略（binding_policy）**：`exclusivity`（none|scope）与 `rebind_cooldown`（off|type_default）为显式产品选项。新装默认 none/off；v6 及更早配置迁移为 scope/type_default（即 0eb5859 行为）并记来源 legacy；管理员实际修改记 admin。desired 保存在 JSON，**有效策略保存在数据库单行并带不可复用 epoch**；保存后重载插件才生效，API 以 desired/effective/pending/activation_error/来源 只读呈现。
+- **排他可选**：none 时不同用户可在同 scope 各自建立恋爱组关系；scope 时同 scope 恋爱组（恋人/此生挚爱）全 scope 仅一位用户。开关由类型定位的约束对象承载（不再依赖 unique_scope 字段值）；off→on 遇历史多人占用拒绝激活（旧策略与 epoch 不变、desired 保留、冲突数上报），on→off 不改任何关系行。
+- **同人约束**：同 identity+scope+type 仅一条 active；同 identity+scope 恋爱组仅一个有效层级。干净账本上由数据库唯一索引保证；历史冲突保留并在 binding_conflicts 诊断，仅阻断受影响身份/scope 的加重型写入（legacy_conflict），普通聊天与其他身份不受影响；管理员按精确 binding_id 结束一条关系，同事务重统计、清零后约束恢复。
+- **同人升级**：同 identity+scope 存在唯一 active 恋人时，合法双向 bind/spouse 提案由后端在同一事务内识别为升级：旧恋人行标记 `end_reason='upgraded'` 并前向链接新绑定 ID，创建此生挚爱并写升级审计；任何失败全事务回滚。升级**不是分手**：upgraded 结束记录不进入任何冷却判定。无当前恋人时直接绑定 spouse 的原路径保留；spouse 存在时恋人提案被拒（romance_occupied，不隐式降级）；同事件重放幂等。
+- **可选冷却**：rebind_cooldown=off 时跳过冷却等待（历史保留、不删）；type_default 时沿用 朋友24h/挚友72h/搭档72h/恋人168h/此生挚爱336h，按同 identity/scope/type 最近一次**真实** ended_at 起算（now - ended_at < hours×3600，到期即可重绑）。升级仍受目标类型（此生挚爱）真实结束冷却约束。
+- **在途轮次**：注入钉扎策略 epoch；结算时策略已变 → 该轮关系提案拒绝（policy_changed），合法计分与安全处理按原事件规则至多一次，重放不重复计分。
+- **提示精简（MIS-127）**：注入不再包含每轮五类型数值门槛矩阵（门槛由后端结算检查，候选类型不按注入前分数裁剪）；新增升级识别与"以结算结果为准"说明；排他占用仅布尔且仅在开启时注入。同输入对照：不可见恋爱路径 2109→1831 字符、可见路径 2244→1923。
+- **迁移与恢复**：配置/数据库升级前各自受保护备份；恢复采用当前有效策略+全新 epoch（备份自带旧索引与 epoch 作废）；当前 scope 策略下恢复含多人冲突的备份在复制前拒绝；staging 完成全部结构/策略写入后才最终复制（复制后零结构写入）。降级回 0eb5859 必须使用升级前成对备份，旧版代码拒绝读写 schema 12（预期守卫）。
