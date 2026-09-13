@@ -330,14 +330,14 @@ class RelationStore:
         global_flag, session_ids = self._scope_admission(scope_allowed, "accounts")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, page_size, (page-1)*page_size]
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT identity,scope_kind,scope_id,values_json,state_json,paused,revision,updated_at FROM accounts WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY updated_at DESC, identity ASC, scope_kind ASC, scope_id ASC LIMIT ? OFFSET ?",params).fetchall()
+            rows=conn.execute("SELECT identity,scope_kind,scope_id,values_json,state_json,paused,revision,updated_at FROM accounts WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY updated_at DESC, identity ASC, scope_kind ASC, scope_id ASC LIMIT ? OFFSET ?",params).fetchall()
             return [{**dict(row),**self._row_account(row)} for row in rows]
 
     def count_accounts_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> int:
         global_flag, session_ids = self._scope_admission(scope_allowed, "accounts")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id]
         with self.lock, self._connection() as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM accounts WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
+            return int(conn.execute("SELECT COUNT(*) FROM accounts WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
 
     def list_bindings_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None, status: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
         """MIS-98: server-side binding pagination behind one single-line
@@ -347,7 +347,7 @@ class RelationStore:
         global_flag, session_ids = self._scope_admission(scope_allowed, "relationship_bindings")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, status, status, page_size, (page-1)*page_size]
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at FROM relationship_bindings WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?) ORDER BY updated_at DESC, binding_id ASC LIMIT ? OFFSET ?",params).fetchall()
+            rows=conn.execute("SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at FROM relationship_bindings WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?) ORDER BY updated_at DESC, binding_id ASC LIMIT ? OFFSET ?",params).fetchall()
             return [dict(row) for row in rows]
 
     def count_bindings_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, status: str | None = None, scope_allowed=None) -> int:
@@ -355,7 +355,7 @@ class RelationStore:
         global_flag, session_ids = self._scope_admission(scope_allowed, "relationship_bindings")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, status, status]
         with self.lock, self._connection() as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM relationship_bindings WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?)",params).fetchone()[0])
+            return int(conn.execute("SELECT COUNT(*) FROM relationship_bindings WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) AND (? IS NULL OR status=?)",params).fetchone()[0])
 
     def list_events_page(self, *, page: int, page_size: int, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> list[dict[str, Any]]:
         """MIS-98: audit event pagination behind one single-line literal query."""
@@ -364,7 +364,7 @@ class RelationStore:
         global_flag, session_ids = self._scope_admission(scope_allowed, "events")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id, page_size, (page-1)*page_size]
         with self.lock, self._connection() as conn:
-            rows=conn.execute("SELECT event_id,identity,scope_kind,scope_id,source_kind,reason,requested_json,applied_json,notes_json,actor,created_at FROM events WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY created_at DESC, event_id ASC LIMIT ? OFFSET ?",params).fetchall()
+            rows=conn.execute("SELECT event_id,identity,scope_kind,scope_id,source_kind,reason,requested_json,applied_json,notes_json,actor,created_at FROM events WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?) ORDER BY created_at DESC, event_id ASC LIMIT ? OFFSET ?",params).fetchall()
             return [dict(row) for row in rows]
 
     def count_events_page(self, *, scope_kind: str | None = None, scope_id: str | None = None, scope_allowed=None) -> int:
@@ -372,7 +372,7 @@ class RelationStore:
         global_flag, session_ids = self._scope_admission(scope_allowed, "events")
         params:list[Any]=[global_flag, session_ids, scope_kind, scope_kind, scope_id, scope_id]
         with self.lock, self._connection() as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM events WHERE (scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
+            return int(conn.execute("SELECT COUNT(*) FROM events WHERE ((scope_kind='global' AND ?) OR (scope_kind='session' AND scope_id IN (SELECT value FROM json_each(?)))) AND (? IS NULL OR scope_kind=?) AND (? IS NULL OR scope_id=?)",params).fetchone()[0])
 
     def list_accounts(self, limit: int = 200, scope_kind: str | None = None) -> list[dict[str, Any]]:
         with self.lock, self._connection() as conn:

@@ -889,6 +889,48 @@ class RestoreMigrationTests(unittest.TestCase):
             self.assertFalse(any(p.name.endswith(".restoring.tmp") for p in (directory / "backups" / "manual").iterdir()))
 
 
+class ScopeStatusFilterTests(unittest.TestCase):
+    """MIS-117: the admission OR clause must be parenthesised before the
+    optional filters bind; unparenthesised, global rows bypassed every
+    scope/status filter and the counts diverged from the rows."""
+
+    @staticmethod
+    def _seed(store):
+        allow = lambda *_: True
+        for kind, scope_id in (("global", ""), ("session", "room")):
+            store.apply_turn_with_binding(
+                event_id="event-" + kind, identity="qq:" + kind,
+                scope_kind=kind, scope_id=scope_id, source_kind="test",
+                evidence="", reason="", requested={}, applied={}, notes={},
+                binding={"binding_id": "binding-" + kind, "type_key": "friend",
+                         "unique_scope": "", "origin": "test", "summary": ""})
+        return allow
+
+    def test_session_filter_excludes_global_rows_everywhere(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            allow = self._seed(store)
+            accounts = store.list_accounts_page(page=1, page_size=10, scope_kind="session", scope_allowed=allow)
+            self.assertEqual(["session"], sorted({row["scope_kind"] for row in accounts}))
+            self.assertEqual(len(accounts), store.count_accounts_page(scope_kind="session", scope_allowed=allow))
+            events = store.list_events_page(page=1, page_size=10, scope_kind="session", scope_allowed=allow)
+            self.assertEqual(["session"], sorted({row["scope_kind"] for row in events}))
+            self.assertEqual(len(events), store.count_events_page(scope_kind="session", scope_allowed=allow))
+            # The reverse filter keeps only global rows.
+            self.assertEqual(["global"], sorted({row["scope_kind"] for row in store.list_accounts_page(page=1, page_size=10, scope_kind="global", scope_allowed=allow)}))
+            self.assertEqual(1, store.count_accounts_page(scope_kind="global", scope_allowed=allow))
+
+    def test_ended_status_filter_excludes_active_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RelationStore(Path(directory))
+            allow = self._seed(store)
+            self.assertEqual([], store.list_bindings_page(page=1, page_size=10, status="ended", scope_allowed=allow))
+            self.assertEqual(0, store.count_bindings_page(status="ended", scope_allowed=allow))
+            self.assertEqual({"active"}, {row["status"] for row in store.list_bindings_page(page=1, page_size=10, status="active", scope_allowed=allow)})
+            self.assertEqual(2, store.count_bindings_page(status="active", scope_allowed=allow))
+            self.assertEqual(2, store.count_bindings_page(scope_allowed=allow))
+
+
 class DecayPeriodTests(unittest.TestCase):
     """MIS-96: one decay per persisted period; floors and timestamps intact."""
 
