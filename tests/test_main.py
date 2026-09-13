@@ -876,6 +876,50 @@ class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([10, 10], await self._deltas([("first-A", "later"), ("first-B", "later")]))
 
 
+class JudgeEpochPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-125 R2: a turn injected under one policy epoch keeps its legal
+    scoring and safety handling when the policy changes mid-turn, but the
+    relationship proposal is rejected with policy_changed - never bound under
+    a stale strategy, and never scored twice."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_stale_epoch_scores_once_but_never_binds(self):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "epoch-1"})()
+        # Lift trust past the friend threshold so the gate admits the
+        # proposal and the epoch check inside the transaction decides.
+        self.plugin.store.set_dimension("qq-adapter:user-1", "global", "", "trust", 600)
+        self.plugin._pin_turn_context(event)
+        ctx = self.plugin._turn_context(event)
+        old_epoch = ctx["policy_epoch"]
+        verdict = ('<relation_judgment>' + json.dumps({
+            "schema_version": 3,
+            "fact_effects": [{"effects": {"trust": 5}}],
+            "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                      "origin": "mutual_dialogue", "mutuality": "clear", "summary": "s"},
+        }) + '</relation_judgment>好的。')
+        # The policy changes after the turn was injected.
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        await self.plugin.judge(event, FakeResponse(verdict))
+        account = self.plugin.store.existing_account("qq-adapter:user-1", "global", "")
+        self.assertEqual(605, account["values"]["trust"])  # scoring applied exactly once
+        self.assertEqual([], self.plugin.store.active_bindings_for("qq-adapter:user-1", "global", ""))
+        notes = json.loads(self.plugin.store.recent("qq-adapter:user-1", "global", "")[0]["notes_json"])
+        self.assertIn("binding_rejected:policy_changed", notes["binding"]["notes"])
+        # A replay of the same event never scores again.
+        self.plugin.store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+        await self.plugin.judge(event, FakeResponse(verdict))
+        self.assertEqual(605, self.plugin.store.existing_account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+
 class BoundaryProtocolTests(unittest.IsolatedAsyncioTestCase):
     """MIS-121: protocol-removal boundaries from the re-review. Component
     order survives whole-block removal regardless of whitespace padding, and
@@ -1234,6 +1278,10 @@ class BackupFullSnapshotEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ok", manifest["integrity"])
         self.assertEqual(12, manifest["schema_version"])
         self.assertEqual(7, manifest["config_version"])
+        # MIS-125 R2: the manifest records the policy snapshot for audits.
+        self.assertEqual("none", manifest["binding_policy"]["desired"]["exclusivity"])
+        self.assertEqual("none", manifest["binding_policy"]["effective"]["exclusivity"])
+        self.assertFalse(manifest["binding_policy"]["pending"])
         # The stale snapshot rotated as a whole group, companions included.
         self.assertFalse(any(name.startswith("stale.") for name in files))
 

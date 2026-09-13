@@ -109,9 +109,13 @@ class MigrationP0Tests(unittest.TestCase):
     def test_migration_respects_active_exclusivity_and_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RelationStore(Path(directory))
+            # MIS-125 R2: exclusivity follows the active policy; the bare test
+            # store falls back to the legacy behaviour, and the cross-user
+            # rejection only appears while the policy says scope.
             self.assertEqual('migrated', store.migrate_confirmed_binding(identity='test:a', scope_kind='global', scope_id=''))
+            store.activate_binding_policy({'exclusivity': 'scope', 'rebind_cooldown': 'off'})
             self.assertEqual('binding_rejected:exclusive', store.migrate_confirmed_binding(identity='test:b', scope_kind='global', scope_id=''))
-            self.assertEqual('binding_rejected:exclusive', store.migrate_confirmed_binding(identity='test:a', scope_kind='global', scope_id='', type_key='romantic_partner'))
+            self.assertEqual('binding_rejected:romance_occupied', store.migrate_confirmed_binding(identity='test:a', scope_kind='global', scope_id='', type_key='romantic_partner'))
             self.assertEqual('already_migrated', store.migrate_confirmed_binding(identity='test:a', scope_kind='global', scope_id=''))
             self.assertEqual('migrated', store.migrate_confirmed_binding(identity='test:b', scope_kind='session', scope_id='room'))
             active = store.active_bindings_for('test:a', 'global', '')

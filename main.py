@@ -57,6 +57,14 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         self.config = self.config_mgr.load_or_create()
         self.admins = {str(item) for item in host_config.get("admins_id", [])}
         self.store = RelationStore(data_root / "plugin_data" / PLUGIN_NAME, self.config)
+        # MIS-125 R2: the desired binding policy activates on reload, inside
+        # one store transaction. A refused activation keeps the previous
+        # effective policy and is surfaced read-only via policy_status.
+        activation = self.store.activate_binding_policy(self.config.get("binding_policy", {}))
+        if activation.get("activated"):
+            logger.info("[关系弧线] binding_policy activated exclusivity=%s epoch=%s", activation["effective"]["exclusivity"], activation["effective"]["epoch"])
+        elif activation.get("reason") == "legacy_conflict":
+            logger.warning("[关系弧线] binding_policy activation refused conflicts=%s effective=%s", activation.get("conflict_scopes"), activation["effective"]["exclusivity"])
         self.plugin_version = PLUGIN_VERSION
         self._decay_task: asyncio.Task | None = None
         self._backup_task: asyncio.Task | None = None
@@ -173,6 +181,9 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                 "message_id": getattr(getattr(event, "message_obj", None), "message_id", None),
                 "directed": self._group_is_directed(event),
                 "settled": self._enabled(event) and self.config.get("llm_judgment_enabled", True),
+                # MIS-125 R2: the policy epoch this turn was injected under; a
+                # settlement against a different epoch may score but not bind.
+                "policy_epoch": self.store.active_binding_policy()["epoch"],
             }
         except Exception:
             # Pinning is an in-memory nicety; never break the host LLM request.
@@ -513,6 +524,7 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                 "safety_mode": self.config.get("interaction_safety", {}).get("llm_mode", "administrator_only"),
                 "auto_duration_minutes": int(self.config.get("interaction_safety", {}).get("auto_duration_minutes", 30)),
                 "type_cooldown_hours": {item["key"]: item["cooldown_hours"] for item in public_directory()},
+                "expected_epoch": ctx.get("policy_epoch") if ctx is not None else None,
             },
             romance_gate=romance_gate, binding_gate=binding_gate)
         if status == "duplicate":
@@ -839,6 +851,7 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             return hashlib.sha256(file.read_bytes()).hexdigest()
         manifest={"created_at":time.time(),"schema_version":schema_version,
                   "config_version":self.config["config_version"],"integrity":integrity,
+                  "binding_policy":self.store.policy_status(),
                   "sha256":{"sqlite":digest(sqlite_path),"config":digest(config_dst)}}
         sqlite_path.with_name(stem+".manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=1),encoding="utf-8")
         return sqlite_path

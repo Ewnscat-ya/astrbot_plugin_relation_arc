@@ -104,7 +104,9 @@ class RelationArcCoreTests(unittest.TestCase):
             _,status=store.apply_turn_with_binding(event_id="e1",identity="qq:user",scope_kind="global",scope_id="",source_kind="private",evidence="",reason="",requested={},applied={},notes={},binding=first)
             self.assertEqual("binding_created",status)
             _,status=store.apply_turn_with_binding(event_id="e2",identity="qq:user",scope_kind="global",scope_id="",source_kind="private",evidence="",reason="",requested={},applied={},notes={},binding=second)
-            self.assertEqual("binding_rejected:exclusive",status)
+            # MIS-125 R2: the same user cannot silently replace a higher
+            # romance tier with a lower one.
+            self.assertEqual("binding_rejected:romance_occupied",status)
             self.assertEqual(1,len(store.list_bindings(status="active")))
 
     def test_ended_romance_binding_releases_exclusive_group_for_rebind(self):
@@ -879,6 +881,123 @@ class BindingPolicyConfigTests(unittest.TestCase):
                              config["binding_policy_source"])
 
 
+class BindingPolicyConstraintTests(unittest.TestCase):
+    """MIS-125 R2: the binding policy is authoritative in the database and
+    every write path honours it across independent connections. The store's
+    config fallback stays legacy-conservative (scope/type_default) for a
+    config that predates the policy fields; tests pass the policy explicitly."""
+
+    def _store(self, directory: Path, exclusivity: str, cooldown: str) -> RelationStore:
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": exclusivity, "rebind_cooldown": cooldown}})
+        store.activate_binding_policy({"exclusivity": exclusivity, "rebind_cooldown": cooldown})
+        return store
+
+    def _bind(self, store: RelationStore, event_id: str, identity: str, type_key: str = "romantic_partner",
+              scope_kind: str = "global", scope_id: str = "", expected_epoch: int | None = None) -> str:
+        binding = {"binding_id": "bid-" + event_id, "type_key": type_key, "unique_scope": "romance",
+                   "origin": "test", "summary": ""}
+        return store.apply_turn_with_binding(
+            event_id=event_id, identity=identity, scope_kind=scope_kind, scope_id=scope_id,
+            source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding,
+            expected_epoch=expected_epoch)[1]
+
+    def test_exclusivity_off_allows_different_users_same_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "none", "off")
+            self.assertEqual("binding_created", self._bind(store, "e1", "qq:a"))
+            self.assertEqual("binding_created", self._bind(store, "e2", "qq:b"))
+            self.assertEqual(2, len(store.list_bindings(status="active")))
+
+    def test_exclusivity_scope_blocks_only_the_second_user(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "scope", "off")
+            self.assertEqual("binding_created", self._bind(store, "e1", "qq:a"))
+            self.assertEqual("binding_rejected:exclusive", self._bind(store, "e2", "qq:b"))
+            # The same user's duplicate stays rejected and other tiers coexist.
+            self.assertEqual("binding_rejected:duplicate", self._bind(store, "e3", "qq:a"))
+            self.assertEqual("binding_created", self._bind(store, "e4", "qq:a", type_key="friend"))
+            self.assertEqual(2, len(store.list_bindings(status="active")))
+
+    def test_second_store_instance_honours_the_database_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._store(Path(directory), "scope", "off")
+            self.assertEqual("binding_created", self._bind(first, "e1", "qq:a"))
+            # A reload builds a new connection: the JSON desired value (none)
+            # is NOT authoritative until activated; the database row decides.
+            second = RelationStore(Path(directory), {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            self.assertEqual("scope", second.active_binding_policy()["exclusivity"])
+            self.assertEqual("binding_rejected:exclusive", self._bind(second, "e2", "qq:b"))
+
+    def test_activation_refusal_keeps_policy_epoch_and_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "none", "off")
+            self.assertEqual("binding_created", self._bind(store, "e1", "qq:a"))
+            self.assertEqual("binding_created", self._bind(store, "e2", "qq:b"))
+            before = store.active_binding_policy()
+            result = store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+            self.assertFalse(result["activated"])
+            self.assertEqual("legacy_conflict", result["reason"])
+            self.assertGreaterEqual(result["conflict_scopes"], 1)
+            self.assertIsNotNone(store.policy_activation_error)
+            after = store.active_binding_policy()
+            self.assertEqual("none", after["exclusivity"])
+            self.assertEqual(before["epoch"], after["epoch"])
+            # Ordinary chat and non-conflicting writes keep working while off.
+            self.assertEqual("binding_created", self._bind(store, "e3", "qq:c"))
+
+    def test_on_to_off_keeps_rows_and_reopens_the_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "scope", "off")
+            self.assertEqual("binding_created", self._bind(store, "e1", "qq:a"))
+            result = store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            self.assertTrue(result["activated"])
+            self.assertEqual("binding_created", self._bind(store, "e2", "qq:b"))
+            self.assertEqual(2, len(store.list_bindings(status="active")))
+
+    def test_restart_without_policy_change_keeps_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "none", "off")
+            epoch = store.active_binding_policy()["epoch"]
+            result = store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            self.assertFalse(result["activated"])
+            self.assertEqual("unchanged", result["reason"])
+            self.assertEqual(epoch, store.active_binding_policy()["epoch"])
+
+    def test_stale_epoch_rejects_the_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(Path(directory), "none", "off")
+            self.assertEqual("binding_rejected:policy_changed",
+                             self._bind(store, "e1", "qq:a", expected_epoch=999))
+            self.assertEqual("binding_created",
+                             self._bind(store, "e2", "qq:a",
+                                        expected_epoch=store.active_binding_policy()["epoch"]))
+
+    def test_legacy_conflicts_block_only_affected_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store(directory, "none", "off")
+            self.assertEqual("binding_created", self._bind(store, "f1", "qq:dup", type_key="friend"))
+            # Simulate a pre-R2 ledger: drop the same-user index and add a
+            # second active friend binding for the same identity directly.
+            raw = sqlite3.connect(directory / "relation_arc.sqlite3")
+            raw.execute("DROP INDEX IF EXISTS idx_binding_identity_type_uq")
+            raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES('dup-2','qq:dup','global','','friend','active','','seed','{}',1,1,NULL,'')")
+            raw.commit()
+            raw.close()
+            # A boot-style reconciliation keeps the rows and diagnoses them.
+            store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            self.assertEqual(1, store.legacy_binding_conflict_count())
+            # The affected identity/scope cannot aggravate the conflict...
+            self.assertEqual("binding_rejected:legacy_conflict", self._bind(store, "f3", "qq:dup", type_key="close_friend"))
+            # ...while every other identity keeps working.
+            self.assertEqual("binding_created", self._bind(store, "f4", "qq:clean", type_key="friend"))
+            # The administrator ends one exact binding; the same transaction
+            # recounts, the ledger is clean and the writes resume.
+            self.assertTrue(store.end_binding("dup-2", "admin"))
+            self.assertEqual(0, store.legacy_binding_conflict_count())
+            self.assertEqual("binding_created", self._bind(store, "f5", "qq:dup", type_key="close_friend"))
+
+
 class RestoreMigrationTests(unittest.TestCase):
     """MIS-117: restoring an older-schema backup must migrate the live copy to
     the current schema; silently leaving the live database on the old version
@@ -941,7 +1060,13 @@ class RestoreMigrationTests(unittest.TestCase):
                 self.assertEqual(SCHEMA_VERSION, int(conn.execute("PRAGMA user_version").fetchone()[0]))
                 self.assertTrue(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_state'").fetchone())
+                # MIS-125 R2: the same-user uniqueness indexes exist on the
+                # migrated copy and the old blanket exclusivity index is gone.
                 self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_identity_type_uq'").fetchone())
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_identity_romance_uq'").fetchone())
+                self.assertFalse(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
             # Scheduler access must not raise, and restored data survived the migration.
             self.assertIsNone(store.get_scheduler_state("decay_last_run"))
@@ -983,6 +1108,60 @@ class RestoreMigrationTests(unittest.TestCase):
         shutil.copy2(backup, directory / "backups" / "manual" / backup.name)
         return backup
 
+    def test_restore_adopts_current_policy_with_fresh_epoch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store_for_policy(directory, "none", "off")
+            self.assertEqual("binding_created", self._bind(store, "r1", "qq:a"))
+            backup = store.backup_now("manual")
+            before_epoch = store.active_binding_policy()["epoch"]
+            result = store.restore_backup(backup.name, kind="manual")
+            self.assertTrue(result["migrated"] is False)
+            # The restored copy runs the CURRENT policy on a brand-new epoch;
+            # the backup's own epoch is never reused.
+            self.assertEqual("none", result["policy"]["exclusivity"])
+            self.assertGreater(result["policy"]["epoch"], before_epoch)
+            with store._connection() as conn:
+                self.assertFalse(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_romance_scope_uq'").fetchone())
+            # The restored ledger carries no cross-user lock: another user
+            # binds romance in the same scope.
+            self.assertEqual("binding_created", self._bind(store, "r2", "qq:b"))
+
+    def test_restore_scope_policy_rejects_conflicting_backup_before_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            store = self._store_for_policy(directory, "scope", "off")
+            self.assertEqual("binding_created", self._bind(store, "s1", "qq:a"))
+            # Simulate a backup-era ledger that carries a multi-user romance
+            # conflict: drop the scope index and insert the second row directly.
+            raw = sqlite3.connect(directory / "relation_arc.sqlite3")
+            raw.execute("DROP INDEX IF EXISTS idx_binding_romance_scope_uq")
+            raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES('legacy-b','qq:b','global','','romantic_partner','active','romance','seed','{}',1,1,NULL,'')")
+            raw.commit()
+            raw.close()
+            backup = store.backup_now("manual")
+            live_before = store.existing_account("qq:a", "global", "")["values"]["trust"]
+            with self.assertRaises(ValueError):
+                store.restore_backup(backup.name, kind="manual")
+            # The live database was never replaced: both rows survive and no
+            # pre_restore snapshot was consumed.
+            self.assertEqual(2, len(store.list_bindings(status="active")))
+            self.assertEqual(live_before, store.existing_account("qq:a", "global", "")["values"]["trust"])
+            self.assertFalse(any(item["kind"] == "pre_restore" for item in store.list_backups()))
+
+    def _store_for_policy(self, directory: Path, exclusivity: str, cooldown: str) -> RelationStore:
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": exclusivity, "rebind_cooldown": cooldown}})
+        store.activate_binding_policy({"exclusivity": exclusivity, "rebind_cooldown": cooldown})
+        return store
+
+    def _bind(self, store: RelationStore, event_id: str, identity: str, type_key: str = "romantic_partner") -> str:
+        binding = {"binding_id": "bid-" + event_id, "type_key": type_key, "unique_scope": "romance",
+                   "origin": "test", "summary": ""}
+        return store.apply_turn_with_binding(
+            event_id=event_id, identity=identity, scope_kind="global", scope_id="",
+            source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding)[1]
+
     def test_restore_staging_index_failure_leaves_live_untouched(self):
         """B02: the exclusivity index is built on the staging copy, so a
         failure there (e.g. a real SQLite allocation limit) propagates before
@@ -996,14 +1175,14 @@ class RestoreMigrationTests(unittest.TestCase):
             store = RelationStore(directory)
             store.account("qq:live", "global", "")
             store.set_dimension("qq:live", "global", "", "trust", 600)
-            with mock.patch.object(store, "_create_unique_binding_index",
+            with mock.patch.object(store, "_reconcile_binding_constraints",
                                    side_effect=sqlite3.OperationalError("database or disk is full")):
                 with self.assertRaises(sqlite3.OperationalError):
                     store.restore_backup(backup.name, kind="manual")
             with store._connection() as conn:
                 self.assertEqual(SCHEMA_VERSION, int(conn.execute("PRAGMA user_version").fetchone()[0]))
                 self.assertTrue(conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_identity_type_uq'").fetchone())
             self.assertEqual(600, store.existing_account("qq:live", "global", "")["values"]["trust"])
             self.assertFalse(any(item["kind"] == "pre_restore" for item in store.list_backups()))
             self.assertFalse(any(p.name.endswith(".restoring.tmp") for p in (directory / "backups" / "manual").iterdir()))
@@ -1042,7 +1221,7 @@ class RestoreMigrationTests(unittest.TestCase):
             with store._connection() as conn:
                 self.assertFalse(conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
-            self.assertEqual(1, store.unique_index_conflicts)
+            self.assertEqual(1, store.legacy_binding_conflict_count())
             self.assertEqual(555, store.existing_account("qq:v9", "global", "")["values"]["trust"])
 
 
