@@ -6,6 +6,7 @@ from quart import request, jsonify
 
 from .config_manager import ConfigRevisionConflict
 from .relation_engine import DIMENSIONS, PUBLIC_DIMENSIONS
+from .relation_store import SCHEMA_VERSION
 from .relationship_types import get_type, public_directory
 
 # Matches main.PLUGIN_NAME; declared here to avoid circular import.
@@ -26,7 +27,10 @@ class PagesApiMixin:
         return jsonify({"success": True, "name": path.name, "kind": "manual"})
     async def _api_migrations(self):
         from quart import jsonify
-        return jsonify({"schema_version": 9, "entries": self.store.list_migrations()})
+        # MIS-117: report the live database version, with the code-supported
+        # version named separately; a hardcoded value silently contradicted
+        # the upgrade checklist.
+        return jsonify({"schema_version": self.store.live_schema_version(), "supported_schema_version": SCHEMA_VERSION, "entries": self.store.list_migrations()})
     async def _api_health(self):
         from quart import jsonify
         days = int(self.config.get("protocol_health", {}).get("retention_days", 30))
@@ -49,7 +53,7 @@ class PagesApiMixin:
                            "ended": binding_ended,
                            "global": binding_global,
                            "session": binding_session}
-        return jsonify({"schema_version": 11, "plugin_version": self.plugin_version, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": account_total, "global": account_global, "session": account_session}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
+        return jsonify({"schema_version": self.store.live_schema_version(), "plugin_version": self.plugin_version, "relation_scope_mode": "global" if self.config.get("is_global_relation", True) else "session", "accounts": {"total": account_total, "global": account_global, "session": account_session}, "bindings": binding_summary, "backups": {kind: sum(item["kind"] == kind for item in self.store.list_backups()) for kind in ("auto", "manual", "migration", "pre_restore")}})
     async def _api_audit(self):
         from quart import request, jsonify
         scope_filter=request.args.get("scope")

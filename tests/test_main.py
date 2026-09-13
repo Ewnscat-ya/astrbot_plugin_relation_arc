@@ -480,8 +480,11 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
     async def test_b3_pages_binding_manager_contract(self):
         root=Path(__file__).resolve().parents[1] / "pages" / "settings"
         text=(root / "index.html").read_text(encoding="utf-8")+(root / "app.js").read_text(encoding="utf-8")
-        for marker in ('data-tab="bindings"', "apiGet('bindings?", "apiPost('bindings'", 'data-end-binding', 'renderBindings'):
+        # MIS-117: bridge endpoints carry no query string; pagination/status
+        # filters ride the separate params object (host rejects '?' endpoints).
+        for marker in ('data-tab="bindings"', "apiGet('bindings'", "apiPost('bindings'", 'data-end-binding', 'renderBindings'):
             self.assertIn(marker, text)
+        self.assertNotIn("apiGet('bindings?", text)
 
     async def test_c4_blacklisted_settlement_does_not_mutate_or_pollute_health(self):
         event=FakeEvent(); kind,sid=self.plugin._scope(event); identity=self.plugin._identity(event)
@@ -1120,6 +1123,38 @@ class BackupFullSnapshotEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(stem + ".manifest.json", files)
         manifest = json.loads((manual_dir / (stem + ".manifest.json")).read_text(encoding="utf-8"))
         self.assertEqual("ok", manifest["integrity"])
+
+
+class PagesDiagnosticsVersionTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-117: diagnostics must report the live database schema version, not
+    a hardcoded stale value; the code-supported version is named separately."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_migrations_endpoint_reports_live_schema(self):
+        from quart import Quart
+        app = Quart("migrations-version")
+        async with app.test_request_context("/migrations"):
+            response = await self.plugin._api_migrations()
+        payload = await response.get_json()
+        self.assertEqual(11, payload["schema_version"])
+        self.assertEqual(self.plugin.store.live_schema_version(), payload["schema_version"])
+        self.assertEqual(11, payload["supported_schema_version"])
+
+    async def test_overview_reports_live_schema(self):
+        from quart import Quart
+        app = Quart("overview-version")
+        async with app.test_request_context("/overview"):
+            response = await self.plugin._api_overview()
+        payload = await response.get_json()
+        self.assertEqual(self.plugin.store.live_schema_version(), payload["schema_version"])
 
 
 class ConfigAccountEditTests(unittest.IsolatedAsyncioTestCase):

@@ -866,6 +866,14 @@ class RelationStore:
             row = conn.execute("SELECT value FROM scheduler_state WHERE key=?", (key,)).fetchone()
             return float(row["value"]) if row else None
 
+    def live_schema_version(self) -> int:
+        """Actual SQLite user_version of the live database. Diagnostics must
+        report what the database is, not what the code constant says (MIS-117:
+        the migrations endpoint hardcoded a stale value and misled upgrade
+        verification)."""
+        with self.lock, self._connection() as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
     def decay_if_due(self, *, floors: dict[str,int], step: int, inactive_before: float, scope_allowed, interval_seconds: int, now: float | None = None) -> bool:
         """MIS-96: apply decay only when the persisted period has elapsed.
 
