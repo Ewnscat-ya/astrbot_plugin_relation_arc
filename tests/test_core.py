@@ -888,6 +888,78 @@ class RestoreMigrationTests(unittest.TestCase):
             self.assertEqual(600, store.existing_account("qq:live", "global", "")["values"]["trust"])
             self.assertFalse(any(p.name.endswith(".restoring.tmp") for p in (directory / "backups" / "manual").iterdir()))
 
+    def _v9_backup_in(self, directory: Path, baseline_dir: Path) -> Path:
+        import shutil
+        baseline_store = self.baseline_cls(baseline_dir)
+        baseline_store.account("qq:v9", "global", "")
+        baseline_store.set_dimension("qq:v9", "global", "", "trust", 555)
+        backup = baseline_store.backup_now("manual")
+        (directory / "backups" / "manual").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(backup, directory / "backups" / "manual" / backup.name)
+        return backup
+
+    def test_restore_staging_index_failure_leaves_live_untouched(self):
+        """B02: the exclusivity index is built on the staging copy, so a
+        failure there (e.g. a real SQLite allocation limit) propagates before
+        the live database is ever replaced, and no pre_restore snapshot is
+        consumed for a restore that never touched live."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            with tempfile.TemporaryDirectory() as baseline_dir:
+                backup = self._v9_backup_in(directory, Path(baseline_dir))
+            store = RelationStore(directory)
+            store.account("qq:live", "global", "")
+            store.set_dimension("qq:live", "global", "", "trust", 600)
+            with mock.patch.object(store, "_create_unique_binding_index",
+                                   side_effect=sqlite3.OperationalError("database or disk is full")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.restore_backup(backup.name, kind="manual")
+            with store._connection() as conn:
+                self.assertEqual(SCHEMA_VERSION, int(conn.execute("PRAGMA user_version").fetchone()[0]))
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
+            self.assertEqual(600, store.existing_account("qq:live", "global", "")["values"]["trust"])
+            self.assertFalse(any(item["kind"] == "pre_restore" for item in store.list_backups()))
+            self.assertFalse(any(p.name.endswith(".restoring.tmp") for p in (directory / "backups" / "manual").iterdir()))
+
+    def test_restore_with_conflicting_bindings_counts_and_succeeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            with tempfile.TemporaryDirectory() as baseline_dir:
+                baseline_store = self.baseline_cls(Path(baseline_dir))
+                baseline_store.account("qq:v9", "global", "")
+                baseline_store.set_dimension("qq:v9", "global", "", "trust", 555)
+                # Two active bindings sharing one exclusive scope: possible in
+                # the v9 baseline, blocked by the current unique index. The
+                # baseline's own write API re-checks exclusivity, so seed the
+                # conflicting rows directly.
+                conn = sqlite3.connect(Path(baseline_dir) / "relation_arc.sqlite3")
+                try:
+                    for suffix in ("a", "b"):
+                        conn.execute(
+                            "INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at) VALUES(?,?,?,?,?,'active',?,?,?,?,?,NULL)",
+                            ("binding-" + suffix, "qq:v9", "global", "", "friend", "dup-group", "seed", "{}", time.time(), time.time()))
+                    conn.commit()
+                finally:
+                    conn.close()
+                backup = baseline_store.backup_now("manual")
+                import shutil
+                (directory / "backups" / "manual").mkdir(parents=True)
+                shutil.copy2(backup, directory / "backups" / "manual" / backup.name)
+
+            store = RelationStore(directory)
+            result = store.restore_backup(backup.name, kind="manual")
+            self.assertTrue(result["migrated"])
+            # The conflict rolls the index create back and is counted; the
+            # index stays absent exactly like a conflicted boot, and the
+            # restored data is intact.
+            with store._connection() as conn:
+                self.assertFalse(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
+            self.assertEqual(1, store.unique_index_conflicts)
+            self.assertEqual(555, store.existing_account("qq:v9", "global", "")["values"]["trust"])
+
 
 class ScopeStatusFilterTests(unittest.TestCase):
     """MIS-117: the admission OR clause must be parenthesised before the

@@ -150,14 +150,24 @@ class RelationStore:
         # bind parameters) and is only created when no conflicting active rows
         # exist; conflicts are counted (sanitised, never identities) and never
         # deleted; every later boot retries.
-        self.unique_index_conflicts = 0
         with self._connection() as conn:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_unique_active_uq ON relationship_bindings(scope_kind,scope_id,unique_scope,status) WHERE status='active' AND unique_scope<>''")
-            except sqlite3.IntegrityError:
-                conn.execute("ROLLBACK")
-                self.unique_index_conflicts = int(conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM relationship_bindings WHERE status='active' AND unique_scope<>'' GROUP BY scope_kind,scope_id,unique_scope HAVING COUNT(*)>1)").fetchone()[0])
+            self.unique_index_conflicts = self._create_unique_binding_index(conn)
+
+    @staticmethod
+    def _create_unique_binding_index(conn) -> int:
+        """Create the exclusivity index inside one transaction. Conflicting
+        active rows roll the create back and return the sanitised conflict
+        count with the index left absent (later boots retry); any other error
+        propagates. Shared by boot and restore staging (MIS-121 B02: the final
+        copy into the live database must not be followed by a structural
+        write that can fail mid-restore)."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_unique_active_uq ON relationship_bindings(scope_kind,scope_id,unique_scope,status) WHERE status='active' AND unique_scope<>''")
+            return 0
+        except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
+            return int(conn.execute("SELECT COUNT(*) FROM (SELECT 1 FROM relationship_bindings WHERE status='active' AND unique_scope<>'' GROUP BY scope_kind,scope_id,unique_scope HAVING COUNT(*)>1)").fetchone()[0])
 
     def _default_values(self) -> dict[str, int]:
         return {**DEFAULT_VALUES, **self.config.get("initial_values", {})}
@@ -1007,13 +1017,20 @@ class RelationStore:
         try:
             self._materialize_staging(source, staging)
             self._migrate_staging(staging, from_version=version, backup_name=source.name)
+            # MIS-121 B02: the exclusivity index is created on the staging copy
+            # too (its conflicts are audited, never deleted), so the final copy
+            # into the live database is not followed by any structural write
+            # that could fail and leave the restore half-applied.
+            staging_conn=sqlite3.connect(staging, timeout=10)
+            try:
+                index_conflicts=self._create_unique_binding_index(staging_conn)
+                staging_conn.commit()
+            finally:
+                staging_conn.close()
             self._verify_staging(staging)
             self.backup_now("pre_restore")
             self._copy_into_live(staging)
-            # The exclusivity index is created outside the plain DDL pass (its
-            # conflicts are audited, never deleted), so re-ensure it on the
-            # restored database too.
-            self._ensure_unique_binding_index()
+            self.unique_index_conflicts=index_conflicts
             return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
                     "integrity": "ok", "migrated": version < SCHEMA_VERSION}
         finally:

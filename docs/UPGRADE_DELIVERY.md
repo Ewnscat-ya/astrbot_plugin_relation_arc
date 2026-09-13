@@ -59,11 +59,12 @@
 
 | 证据 | 结果 | 位置 |
 |---|---|---|
-| 全量回归（venv + astrbot 4.28.0） | 191/191 通过（27.0s） | `python -m unittest discover -s tests` |
+| 全量回归（venv + astrbot 4.28.0） | 206/206 通过（32.2s） | `python -m unittest discover -s tests` |
 | 全量回归（venv + astrbot 4.26.0 声明下限） | 191/191 通过 | 见 BASELINE_VALIDATION.md 双版本矩阵 |
-| 无宿主回归（系统 Python，无 astrbot 包） | 78/78 通过（core+p0） | `python -m unittest tests.test_core tests.test_p0` |
+| 无宿主回归（系统 Python，无 astrbot 包） | 80/80 通过（core+p0） | `python -m unittest tests.test_core tests.test_p0` |
 | 行为合同冻结样例复核 | 六类样例关键值与 `BEHAVIOR_CONTRACT.md` 一致，无漂移 | `tools/behavior_contract_samples.py` 复跑 |
 | 外部复核缺陷修复轮（MIS-117） | 复核提出的 2 P1 + 7 P2 及补充 P1（bridge 参数契约）全部修复；复核协议脚本 4/4、存储脚本 2/2 转正通过；宿主注册链在 4.28.0 与 4.26.0 下限均为 16 处理器归属 / 14 命令可分发 | 提交 bf7ca20 / 8069867 / 92b74d5 / 42f8acb / 20be4d3 / 4bbf44b |
+| 复验待修 B01/B02（MIS-121） | B01 图文顺序回归修复（合并回退仅对内容差异触发）+ 复核边界脚本 13/13 正式移植；B02 排他索引移入暂存副本，复制后零结构写入，容量受限场景恢复完整成功、三个复制前故障点活库零变化 | 提交 88a6009 / 本轮 B02 提交 |
 | Pages 前端契约 | node 合成 DOM 驱动真实 `app.js`：纯 endpoint + 独立 params、去重含参数、翻页点击、配置冲突重建（12 断言） | `tests/pages_app_harness.mjs`、`tests/test_pages_js.py` |
 | 存储基准 | 固定种子基线数据 | `docs/PERFORMANCE_BASELINE.md`、`tools/benchmark_store.py` |
 | 复用决策 / 评估决策 | 文档化 | `docs/REUSE_DECISIONS.md`、`docs/EVALUATION_DECISIONS.md` |
