@@ -222,5 +222,52 @@ class HostCompatTests(unittest.TestCase):
         self.assertEqual(200, listing.status_code)
 
 
+@unittest.skipUnless(HAS_HOST, "astrbot host package not installed (missing dependency, not a failure)")
+class HostCommandRegistrationTests(unittest.TestCase):
+    """MIS-117: the host registers a handler under the function's __module__
+    captured at decoration time and claims it only for the plugin registered
+    under that exact module. Every decorated chat command must therefore be
+    owned by the plugin module and survive the activated + event-type filter
+    chain (instance binding through a full star_manager load stays with the
+    real-host acceptance task)."""
+
+    COMMANDS = (
+        "relation", "history", "query_relation", "query_current_scope",
+        "query_global_scope", "query_all_scopes", "relationship_route",
+        "romance_global_switch", "set_safety", "admin_route", "set_dimension",
+        "adjust_dimension", "settlement_blacklist_admin", "end_relationship_binding",
+    )
+
+    def test_all_decorated_handlers_owned_by_plugin_module(self):
+        from astrbot.core.star.star import star_map
+        from astrbot.core.star.star_handler import star_handlers_registry
+
+        metadata = star_map[RelationArc.__module__]
+        metadata.activated = True
+        handlers = [h for h in star_handlers_registry if h.handler_module_path.startswith(PLUGIN_NAME)]
+        self.assertTrue(handlers)
+        strays = sorted({h.handler_module_path for h in handlers} - {PLUGIN_NAME + ".main"})
+        self.assertEqual([], strays)
+        owned = {h.handler_name for h in star_handlers_registry.get_handlers_by_module_name(metadata.module_path)}
+        for name in (*self.COMMANDS, "judge", "inject"):
+            self.assertIn(name, owned)
+
+    def test_all_commands_dispatchable_through_filter_chain(self):
+        from astrbot.core.star.star import star_map
+        from astrbot.core.star.star_handler import star_handlers_registry, EventType
+
+        star_map[RelationArc.__module__].activated = True
+        dispatchable = {
+            h.handler_name
+            for h in star_handlers_registry.get_handlers_by_event_type(EventType.AdapterMessageEvent)
+            if h.handler_module_path == PLUGIN_NAME + ".main"
+        }
+        missing = [name for name in self.COMMANDS if name not in dispatchable]
+        self.assertEqual([], missing)
+        # LLM hooks are provider events, never chat commands.
+        self.assertNotIn("judge", dispatchable)
+        self.assertNotIn("inject", dispatchable)
+
+
 if __name__ == "__main__":
     unittest.main()
