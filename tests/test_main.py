@@ -11,7 +11,8 @@ sys.path.insert(0, str(ROOT.parent))
 from astrbot_plugin_relation_arc.main import RelationArc
 from astrbot_plugin_relation_arc.relation_engine import DEFAULT_VALUES
 from astrbot.api.provider import ProviderRequest
-from astrbot.core.message.components import Plain
+from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.message.components import Image, Plain, Reply
 from astrbot.core.message.message_event_result import MessageChain
 
 
@@ -848,6 +849,134 @@ class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
         deltas, final = await self._four_identical_turns(include_evidence=False)
         self.assertEqual([10, 6, 3, 0], deltas)
         self.assertEqual(419, final)
+
+    async def _deltas(self, evidence_pairs):
+        previous, deltas = 400, []
+        for index, pair in enumerate(evidence_pairs):
+            facts = [{"effects": {"trust": 10}, "evidence": pair[0]}, {"effects": {"respect": 2}, "evidence": pair[1]}]
+            text = ('<relation_judgment>' + json.dumps({"schema_version": 3, "fact_effects": facts})
+                    + '</relation_judgment>好的。')
+            event = FakeEvent()
+            event.message_obj = type("Message", (), {"message_id": f"boundary-{index}"})()
+            await self.plugin.judge(event, FakeResponse(text))
+            value = self.plugin.store.existing_account("qq-adapter:user-1", "global", "")["values"]["trust"]
+            deltas.append(value - previous)
+            previous = value
+        return deltas
+
+    async def test_first_evidence_stable_later_evidence_changes_still_decay(self):
+        # Only the first fact's evidence is the repeat key; a changing second
+        # fact's evidence never resets the decay chain.
+        self.assertEqual([10, 6, 3, 0], await self._deltas([("first", f"later-{i}") for i in range(4)]))
+
+    async def test_first_evidence_absent_uses_signature_fallback(self):
+        self.assertEqual([10, 6, 3, 0], await self._deltas([("", f"later-{i}") for i in range(4)]))
+
+    async def test_different_first_evidence_does_not_decay_on_signature(self):
+        self.assertEqual([10, 10], await self._deltas([("first-A", "later"), ("first-B", "later")]))
+
+
+class BoundaryProtocolTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-121: protocol-removal boundaries from the re-review. Component
+    order survives whole-block removal regardless of whitespace padding, and
+    the three-part split variants (bare JSON, tagged block, truncated tail)
+    never leak protocol material into the outgoing chain."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    @staticmethod
+    def verdict(delta=2):
+        return ('<relation_judgment>' + json.dumps({"schema_version": 3, "fact_effects": [{"effects": {"trust": delta}}]}) + '</relation_judgment>')
+
+    @staticmethod
+    def image():
+        # Pure component construction; the URL is never fetched.
+        return Image.fromURL("https://example.invalid/synthetic-image.png")
+
+    def _read(self, parts, text=""):
+        # The real host entity: completion_text is a derived property of
+        # result_chain, exactly the payload shape the host hands the plugin.
+        response = LLMResponse(role="assistant", completion_text=text,
+                               result_chain=MessageChain(parts) if parts is not None else None)
+        parsed, has_protocol, source, has_text = self.plugin._read_and_strip_judgment(response, "synthetic")
+        return response, parsed, source
+
+    def test_completion_multiple_blocks_uses_last_and_keeps_prose(self):
+        response, parsed, source = self._read(None, text="Before" + self.verdict(2) + "Middle" + self.verdict(4) + "After")
+        self.assertEqual("BeforeMiddleAfter", response.completion_text)
+        self.assertEqual(4, parsed.effects[0]["effects"]["trust"])
+        self.assertEqual("completion_text", source)
+
+    def test_completion_bare_json_removal(self):
+        response, parsed, source = self._read(None, text='{"schema_version":3,"fact_effects":[]}\nBody')
+        self.assertEqual("Body", response.completion_text)
+        self.assertEqual(1, parsed.stats["bare"])
+
+    def test_result_chain_is_authoritative_over_backing_completion(self):
+        response, parsed, source = self._read([Plain(self.verdict(2) + "Chain body")], text=self.verdict(8) + "Backing body")
+        self.assertEqual("result_chain", source)
+        self.assertEqual(2, parsed.effects[0]["effects"]["trust"])
+        self.assertEqual("Chain body", response.completion_text)
+
+    def test_ordinary_text_and_arbitrary_json_preserve_original_chain(self):
+        img = self.image()
+        parts = [Plain('{"ordinary":true}\n'), img, Plain("  Body\nAfter  ")]
+        response, parsed, _ = self._read(parts)
+        self.assertEqual(parts, response.result_chain.chain)
+        self.assertEqual([], parsed.effects)
+
+    def test_whole_block_without_boundary_whitespace_preserves_component_order(self):
+        img = self.image()
+        quote = Reply(id="synthetic-message")
+        response, _, _ = self._read([Plain(self.verdict() + "Before"), img, Plain("After"), quote])
+        self.assertEqual([Plain("Before"), img, Plain("After"), quote], response.result_chain.chain)
+
+    def test_whole_block_with_newline_preserves_component_order(self):
+        # B01 regression: the entire protocol sits in the first Plain, so the
+        # cross-component merge exception must not apply, and a mere newline
+        # padding difference must never merge prose across the image.
+        img = self.image()
+        quote = Reply(id="synthetic-message")
+        response, _, _ = self._read([Plain(self.verdict() + "\nBefore\n"), img, Plain("After"), quote])
+        self.assertEqual([Plain("Before"), img, Plain("After"), quote], response.result_chain.chain)
+
+    def test_bare_protocol_three_parts_and_empty_parts_do_not_leak(self):
+        img = self.image()
+        response, _, _ = self._read([Plain(""), Plain("  "), Plain('{"schema_version":3,'),
+                                     Plain('"fact_effects":['), Plain(']}\nBefore'), img, Plain("After")])
+        texts = "\n".join(x.text for x in response.result_chain.chain if isinstance(x, Plain))
+        self.assertEqual("Before\nAfter", texts)
+        self.assertNotIn("schema_version", texts)
+        self.assertIn(img, response.result_chain.chain)
+
+    def test_tagged_protocol_three_parts_does_not_lose_prose(self):
+        img = self.image()
+        response, _, _ = self._read([Plain('Before<relation_judgment>{"schema_version":3,'), img,
+                                     Plain('"fact_effects":['), Plain(']}</relation_judgment>After')])
+        texts = "\n".join(x.text for x in response.result_chain.chain if isinstance(x, Plain))
+        self.assertEqual("BeforeAfter", texts)
+        self.assertIn(img, response.result_chain.chain)
+
+    def test_truncated_tail_three_parts_does_not_leak(self):
+        img = self.image()
+        response, _, _ = self._read([Plain("Before"), img,
+                                     Plain('<relation_judgment>{"schema_version":3,'), Plain('"fact_effects":['), Plain('{"effects":')])
+        texts = "\n".join(x.text for x in response.result_chain.chain if isinstance(x, Plain))
+        self.assertEqual("Before", texts)
+        self.assertIn(img, response.result_chain.chain)
+
+    def test_unclosed_opener_with_ordinary_prose_remains_visible(self):
+        img = self.image()
+        parts = [Plain("Before<relation_judgment>ordinary discussion"), img, Plain("After")]
+        response, _, _ = self._read(parts)
+        self.assertEqual(parts, response.result_chain.chain)
 
 
 class SettlementHealthTests(unittest.IsolatedAsyncioTestCase):

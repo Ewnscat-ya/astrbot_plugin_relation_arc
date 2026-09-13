@@ -389,7 +389,7 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                             cleaned_parts[index] = (part_text[:local_start] + part_text[local_end:]).strip()
                 joined_cleaned = "\n".join(cleaned_parts)
                 if (BLOCK.search(joined_cleaned) or "relation_judgment" in joined_cleaned
-                        or joined_cleaned.strip() != parsed.clean_text.strip()):
+                        or "".join(joined_cleaned.split()) != "".join(parsed.clean_text.split())):
                     replacement_done = False
                     new_chain = []
                     for part in result_chain.chain:
