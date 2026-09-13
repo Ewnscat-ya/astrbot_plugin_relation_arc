@@ -59,10 +59,12 @@
 
 | 证据 | 结果 | 位置 |
 |---|---|---|
-| 全量回归（venv + astrbot 4.28.0） | 176/176 通过（16.3s） | `python -m unittest discover -s tests` |
-| 全量回归（venv + astrbot 4.26.0 声明下限） | 176/176 通过 | 见 BASELINE_VALIDATION.md 双版本矩阵 |
-| 无宿主回归（系统 Python，无 astrbot 包） | 74/74 通过（core+p0） | `python -m unittest tests.test_core tests.test_p0` |
+| 全量回归（venv + astrbot 4.28.0） | 191/191 通过（27.0s） | `python -m unittest discover -s tests` |
+| 全量回归（venv + astrbot 4.26.0 声明下限） | 191/191 通过 | 见 BASELINE_VALIDATION.md 双版本矩阵 |
+| 无宿主回归（系统 Python，无 astrbot 包） | 78/78 通过（core+p0） | `python -m unittest tests.test_core tests.test_p0` |
 | 行为合同冻结样例复核 | 六类样例关键值与 `BEHAVIOR_CONTRACT.md` 一致，无漂移 | `tools/behavior_contract_samples.py` 复跑 |
+| 外部复核缺陷修复轮（MIS-117） | 复核提出的 2 P1 + 7 P2 及补充 P1（bridge 参数契约）全部修复；复核协议脚本 4/4、存储脚本 2/2 转正通过；宿主注册链在 4.28.0 与 4.26.0 下限均为 16 处理器归属 / 14 命令可分发 | 提交 bf7ca20 / 8069867 / 92b74d5 / 42f8acb / 20be4d3 / 4bbf44b |
+| Pages 前端契约 | node 合成 DOM 驱动真实 `app.js`：纯 endpoint + 独立 params、去重含参数、翻页点击、配置冲突重建（12 断言） | `tests/pages_app_harness.mjs`、`tests/test_pages_js.py` |
 | 存储基准 | 固定种子基线数据 | `docs/PERFORMANCE_BASELINE.md`、`tools/benchmark_store.py` |
 | 复用决策 / 评估决策 | 文档化 | `docs/REUSE_DECISIONS.md`、`docs/EVALUATION_DECISIONS.md` |
 
@@ -70,10 +72,16 @@
 
 | 未覆盖项 | 原因 | 跟进 |
 |---|---|---|
-| 真实宿主端到端验收（真实浏览器 + 真实消息平台 + 持久部署） | 本机无部署宿主环境，按验收纪律不降标为"已通过" | Linear 后续承接 issue；清单见 `docs/HOST_COMPATIBILITY.md` |
+| 真实宿主端到端验收（真实浏览器 + 真实消息平台 + 持久部署） | 本机无部署宿主环境，按验收纪律不降标为"已通过" | Linear `MIS-116` 承接（含三项列表页真实浏览器首次加载/翻页/筛选复核）；清单见 `docs/HOST_COMPATIBILITY.md` |
 
 ## 6. 已知实现说明（非行为差异）
 
 - MIS-100 拆分后，`_api_bindings` 处理器仍位于 `main.py`（其余 7 个已入
   `pages_api.py` 的 Mixin）。注册经由 Mixin 的 `self._api_bindings` 动态绑定，
   行为与测试覆盖一致，仅文件归属不一致；留作后续小整理，不影响本交付。
+- MIS-117 修复轮将 14 条带装饰器聊天命令入口移回 `main.py` 类体（宿主按
+  函数 `__module__` 在装饰时登记并按插件模块归属）；`commands.py` 仅保留
+  非装饰器助手。这是宿主注册契约要求，非行为变更。
+- 复核报告提示的环境事实：本机 C 盘曾满载导致临时目录偶发 `disk is full`
+  测试抖动；测试代码保持可移植（默认临时目录），本机复验时以 `TMPDIR`
+  指向 D 盘运行。
