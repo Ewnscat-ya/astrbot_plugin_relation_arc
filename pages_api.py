@@ -114,7 +114,12 @@ class PagesApiMixin:
     async def _api_config(self):
         from quart import request, jsonify
         if request.method == "GET":
-            return jsonify(self.config)
+            # MIS-124 R1: the read-only runtime policy status rides beside the
+            # writable desired config; the POST endpoint keeps rejecting it as
+            # an unknown field, so status can never be saved as configuration.
+            payload = dict(self.config)
+            payload["policy_status"] = self.store.policy_status()
+            return jsonify(payload)
         data = await request.get_json()
         if not isinstance(data, dict):
             return jsonify({"error": "配置必须是 JSON 对象"}), 400

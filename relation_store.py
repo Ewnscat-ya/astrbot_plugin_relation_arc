@@ -12,7 +12,7 @@ from typing import Any
 
 from .relation_engine import DIMENSIONS, DEFAULT_VALUES, apply_delta, clamp
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 BACKUP_KINDS = {"auto", "manual", "migration", "pre_restore"}
 SAFETY_RANK = {"normal": 0, "slow_down": 1, "pause_intimacy": 2}
 
@@ -32,6 +32,9 @@ class RelationStore:
             (self.backup_dir / kind).mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.migration_events: list[dict[str, Any]] = []
+        # MIS-124 R1: set when a desired policy activation was refused (R2
+        # fills the activation machinery); surfaced read-only via policy_status.
+        self.policy_activation_error: dict[str, Any] | None = None
         self._init()
 
     def _conn(self) -> sqlite3.Connection:
@@ -97,6 +100,7 @@ class RelationStore:
             conn.execute("BEGIN IMMEDIATE")
             self._apply_schema_ddl(conn)
             self._stamp_schema_version(conn, old_version, migration_backup.name if migration_backup else "")
+            self._ensure_active_policy_row(conn)
         self._ensure_unique_binding_index()
 
     def _apply_schema_ddl(self, conn) -> None:
@@ -118,6 +122,11 @@ class RelationStore:
         # MIS-96: persisted scheduler period markers (decay_last_run), so a
         # restart or duplicate start can never apply the same period twice.
         conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
+        # MIS-124 R1: the authoritative active binding policy lives in the
+        # database (single row); the JSON config only holds the desired
+        # values. The epoch is never reused, so in-flight turns can detect a
+        # policy change between inject and settlement.
+        conn.execute("CREATE TABLE IF NOT EXISTS binding_policy (id INTEGER PRIMARY KEY CHECK(id=1), exclusivity TEXT NOT NULL CHECK(exclusivity IN ('none','scope')), rebind_cooldown TEXT NOT NULL CHECK(rebind_cooldown IN ('off','type_default')), epoch INTEGER NOT NULL, updated_at REAL NOT NULL)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
         # MIS-97: settlement window scans and health retention filter by
@@ -131,6 +140,48 @@ class RelationStore:
         if "last_interaction" not in columns:
             # C3 deliberately distinguishes accepted interaction time from any edit/read timestamp.
             conn.execute("ALTER TABLE accounts ADD COLUMN last_interaction REAL NOT NULL DEFAULT 0")
+        binding_columns = {row[1] for row in conn.execute("PRAGMA table_info(relationship_bindings)")}
+        if "end_reason" not in binding_columns:
+            # MIS-124 R1 groundwork (consumed by R3): 'upgraded' marks a romance
+            # replacement that is not a real breakup and never starts a cooldown.
+            conn.execute("ALTER TABLE relationship_bindings ADD COLUMN end_reason TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_active_policy_row(self, conn) -> None:
+        """MIS-124 R1: the authoritative policy row must exist before any
+        binding write. The first row seeds from the validated desired config;
+        a missing field falls back to the 0eb5859 behaviour."""
+        if conn.execute("SELECT 1 FROM binding_policy WHERE id=1").fetchone():
+            return
+        desired = self.config.get("binding_policy") if isinstance(self.config.get("binding_policy"), dict) else {}
+        conn.execute("INSERT INTO binding_policy(id,exclusivity,rebind_cooldown,epoch,updated_at) VALUES(1,?,?,1,?)",
+                     (desired.get("exclusivity", "scope"), desired.get("rebind_cooldown", "type_default"), time.time()))
+
+    def active_binding_policy(self) -> dict[str, Any]:
+        """Authoritative effective policy. The JSON config only holds desired
+        values; the database row decides what binding writes enforce."""
+        with self.lock, self._connection() as conn:
+            row = conn.execute("SELECT exclusivity,rebind_cooldown,epoch,updated_at FROM binding_policy WHERE id=1").fetchone()
+            if not row:
+                self._ensure_active_policy_row(conn)
+                row = conn.execute("SELECT exclusivity,rebind_cooldown,epoch,updated_at FROM binding_policy WHERE id=1").fetchone()
+        return {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
+                "epoch": int(row["epoch"]), "updated_at": float(row["updated_at"])}
+
+    def policy_status(self) -> dict[str, Any]:
+        """MIS-124 R1: read-only runtime state for the Pages API (desired vs
+        effective vs pending). Never writable through the config endpoint."""
+        effective = self.active_binding_policy()
+        desired = self.config.get("binding_policy") if isinstance(self.config.get("binding_policy"), dict) else {}
+        source = self.config.get("binding_policy_source") if isinstance(self.config.get("binding_policy_source"), dict) else {}
+        return {
+            "desired": {"exclusivity": desired.get("exclusivity"), "rebind_cooldown": desired.get("rebind_cooldown")},
+            "effective": {"exclusivity": effective["exclusivity"], "rebind_cooldown": effective["rebind_cooldown"],
+                          "epoch": effective["epoch"]},
+            "pending": (desired.get("exclusivity") != effective["exclusivity"])
+                       or (desired.get("rebind_cooldown") != effective["rebind_cooldown"]),
+            "activation_error": self.policy_activation_error,
+            "source": {"exclusivity": source.get("exclusivity"), "rebind_cooldown": source.get("rebind_cooldown")},
+        }
 
     def _stamp_schema_version(self, conn, from_version: int, backup_name: str) -> None:
         if from_version < SCHEMA_VERSION:
@@ -139,7 +190,7 @@ class RelationStore:
         # SQLite PRAGMA cannot bind parameters, so the version literal is
         # written directly and verified against SCHEMA_VERSION on read-back;
         # any drift fails loudly instead of silently mislabelling a database.
-        conn.execute("PRAGMA user_version=11")
+        conn.execute("PRAGMA user_version=12")
         written = conn.execute("PRAGMA user_version").fetchone()[0]
         if written != SCHEMA_VERSION:
             raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")

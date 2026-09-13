@@ -7,7 +7,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
+
+# MIS-124 R1: the binding-policy options are explicit product choices. Fresh
+# installs start with both OFF; a pre-v7 config is migrated to the 0eb5859
+# behaviour (scope / type_default) and its source is recorded so the UI can
+# offer the recommended switch without guessing where a value came from.
+BINDING_EXCLUSIVITY_VALUES = ("none", "scope")
+REBIND_COOLDOWN_VALUES = ("off", "type_default")
+POLICY_SOURCE_VALUES = ("default", "legacy", "admin")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "config_version": CONFIG_VERSION,
@@ -55,6 +63,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_blacklist": {"enabled": False, "settlement_limit": 100},
     # MIS-99: save-revision counter, separate from the business config_version.
     "config_revision": 0,
+    # MIS-124 R1: desired binding policy. Only the store's active_policy (and
+    # a reload) makes these effective; see relation_store.binding_policy.
+    "binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"},
+    "binding_policy_source": {"exclusivity": "default", "rebind_cooldown": "default"},
 }
 
 
@@ -109,12 +121,29 @@ class PluginConfigManager:
             return _merge(DEFAULT_CONFIG, raw)
         backup = self._protected_backup(old_version)
         migrated = _merge(DEFAULT_CONFIG, raw)
+        self._migrate_binding_policy(migrated, raw)
         migrated["config_version"] = CONFIG_VERSION
         self.migration_events.append({
             "component": "config", "from_version": old_version,
             "to_version": CONFIG_VERSION, "backup": backup.name,
         })
         return migrated
+
+    @staticmethod
+    def _migrate_binding_policy(migrated: dict[str, Any], raw: dict[str, Any]) -> None:
+        """MIS-124 R1: a pre-v7 config never carried binding_policy, so the
+        0eb5859 behaviour (cross-user romance exclusivity on, type cooldown
+        on) becomes the explicit legacy value; any key the file did provide
+        counts as an explicit administrator choice and is preserved. Default
+        values from DEFAULT_CONFIG must never overwrite the legacy migration."""
+        raw_policy = raw.get("binding_policy") if isinstance(raw.get("binding_policy"), dict) else {}
+        for key, legacy_value in (("exclusivity", "scope"), ("rebind_cooldown", "type_default")):
+            if key in raw_policy:
+                migrated["binding_policy"][key] = raw_policy[key]
+                migrated["binding_policy_source"][key] = "admin"
+            else:
+                migrated["binding_policy"][key] = legacy_value
+                migrated["binding_policy_source"][key] = "legacy"
 
     def load_or_create(self) -> dict[str, Any]:
         if self.path.exists():
@@ -164,6 +193,13 @@ class PluginConfigManager:
         candidate = _merge(base, value)
         candidate["config_revision"] = int(base.get("config_revision", 0)) + 1
         candidate["config_version"] = CONFIG_VERSION
+        # MIS-124 R1: a Pages save that actually changes a binding-policy key
+        # records that key as an explicit administrator choice; untouched keys
+        # keep their original source.
+        incoming_policy = value.get("binding_policy") if isinstance(value.get("binding_policy"), dict) else {}
+        for key in ("exclusivity", "rebind_cooldown"):
+            if key in incoming_policy and incoming_policy[key] != base.get("binding_policy", {}).get(key):
+                candidate["binding_policy_source"][key] = "admin"
         self._validate(candidate)
         # Publish only after atomic replacement; keep caller root aliases live.
         self.save(candidate)
@@ -202,3 +238,7 @@ class PluginConfigManager:
         if not isinstance(blacklist,dict) or not isinstance(blacklist.get("enabled"),bool) or type(blacklist.get("settlement_limit")) is not int or not 1<=blacklist["settlement_limit"]<=100000: raise ValueError("auto_blacklist invalid")
         backup=config.get("backup",{})
         if not isinstance(backup,dict) or not isinstance(backup.get("enabled"),bool) or type(backup.get("interval_hours")) is not int or not 1<=backup["interval_hours"]<=8760 or type(backup.get("retention_hours")) is not int or not 1<=backup["retention_hours"]<=87600: raise ValueError("backup invalid")
+        policy=config.get("binding_policy")
+        if not isinstance(policy,dict) or policy.get("exclusivity") not in BINDING_EXCLUSIVITY_VALUES or policy.get("rebind_cooldown") not in REBIND_COOLDOWN_VALUES: raise ValueError("binding_policy invalid")
+        source=config.get("binding_policy_source")
+        if not isinstance(source,dict) or source.get("exclusivity") not in POLICY_SOURCE_VALUES or source.get("rebind_cooldown") not in POLICY_SOURCE_VALUES: raise ValueError("binding_policy_source invalid")

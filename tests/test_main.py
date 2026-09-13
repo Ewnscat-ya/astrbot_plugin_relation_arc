@@ -1181,8 +1181,8 @@ class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manifest_path.is_file())
         manifest = jsonlib.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual("ok", manifest["integrity"])
-        self.assertEqual(11, manifest["schema_version"])
-        self.assertEqual(6, manifest["config_version"])
+        self.assertEqual(12, manifest["schema_version"])
+        self.assertEqual(7, manifest["config_version"])
 
     async def test_backups_api_surfaces_scheduler_state(self):
         from quart import Quart
@@ -1232,8 +1232,8 @@ class BackupFullSnapshotEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(stem + ".manifest.json", files)
         manifest = json.loads((auto_dir / (stem + ".manifest.json")).read_text(encoding="utf-8"))
         self.assertEqual("ok", manifest["integrity"])
-        self.assertEqual(11, manifest["schema_version"])
-        self.assertEqual(6, manifest["config_version"])
+        self.assertEqual(12, manifest["schema_version"])
+        self.assertEqual(7, manifest["config_version"])
         # The stale snapshot rotated as a whole group, companions included.
         self.assertFalse(any(name.startswith("stale.") for name in files))
 
@@ -1273,9 +1273,9 @@ class PagesDiagnosticsVersionTests(unittest.IsolatedAsyncioTestCase):
         async with app.test_request_context("/migrations"):
             response = await self.plugin._api_migrations()
         payload = await response.get_json()
-        self.assertEqual(11, payload["schema_version"])
+        self.assertEqual(12, payload["schema_version"])
         self.assertEqual(self.plugin.store.live_schema_version(), payload["schema_version"])
-        self.assertEqual(11, payload["supported_schema_version"])
+        self.assertEqual(12, payload["supported_schema_version"])
 
     async def test_overview_reports_live_schema(self):
         from quart import Quart
@@ -1284,6 +1284,77 @@ class PagesDiagnosticsVersionTests(unittest.IsolatedAsyncioTestCase):
             response = await self.plugin._api_overview()
         payload = await response.get_json()
         self.assertEqual(self.plugin.store.live_schema_version(), payload["schema_version"])
+
+
+class PolicyStatusApiTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-124 R1: the Pages config endpoint exposes the desired config plus a
+    read-only policy_status block; the status itself is never writable and a
+    saved-but-not-reloaded policy shows as pending with the effective values
+    untouched."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _get_config(self):
+        from quart import Quart
+        app = Quart("policy-status")
+        async with app.test_request_context("/config"):
+            response = await self.plugin._api_config()
+        return await response.get_json()
+
+    async def test_fresh_boot_effective_matches_desired(self):
+        payload = await self._get_config()
+        status = payload["policy_status"]
+        self.assertEqual("none", status["desired"]["exclusivity"])
+        self.assertEqual("off", status["desired"]["rebind_cooldown"])
+        self.assertEqual("none", status["effective"]["exclusivity"])
+        self.assertEqual("off", status["effective"]["rebind_cooldown"])
+        self.assertFalse(status["pending"])
+        self.assertIsNone(status["activation_error"])
+        self.assertGreaterEqual(status["effective"]["epoch"], 1)
+
+    async def test_saved_policy_is_pending_until_reload(self):
+        from quart import Quart
+        app = Quart("policy-save")
+        async with app.test_request_context("/config", method="POST", json={
+                "expected_revision": 0,
+                "binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"}}):
+            response = await self.plugin._api_config()
+        self.assertEqual(200, response.status_code)
+        status = (await self._get_config())["policy_status"]
+        self.assertEqual("scope", status["desired"]["exclusivity"])
+        self.assertEqual("type_default", status["desired"]["rebind_cooldown"])
+        self.assertEqual("none", status["effective"]["exclusivity"])
+        self.assertEqual("off", status["effective"]["rebind_cooldown"])
+        self.assertTrue(status["pending"])
+        self.assertEqual("admin", status["source"]["exclusivity"])
+        self.assertEqual("admin", status["source"]["rebind_cooldown"])
+
+    async def test_policy_status_is_not_writable(self):
+        from quart import Quart
+        app = Quart("policy-readonly")
+        async with app.test_request_context("/config", method="POST", json={
+                "policy_status": {"effective": {"exclusivity": "none"}}}):
+            response = await self.plugin._api_config()
+        body, status = response
+        self.assertEqual(400, status)
+        self.assertIn("unknown config fields", (await body.get_json())["error"])
+
+    async def test_invalid_binding_policy_rejected(self):
+        from quart import Quart
+        app = Quart("policy-invalid")
+        async with app.test_request_context("/config", method="POST", json={
+                "binding_policy": {"exclusivity": "everyone", "rebind_cooldown": "off"}}):
+            response = await self.plugin._api_config()
+        body, status = response
+        self.assertEqual(400, status)
+        self.assertIn("binding_policy invalid", (await body.get_json())["error"])
 
 
 class ConfigAccountEditTests(unittest.IsolatedAsyncioTestCase):

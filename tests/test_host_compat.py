@@ -143,7 +143,9 @@ class HostCompatTests(unittest.TestCase):
         response = self.client.get(f"/ext/{self.prefix('config')}")
         self.assertEqual(200, response.status_code)
         body = response.json()
-        self.assertEqual(6, body["config_version"])
+        self.assertEqual(7, body["config_version"])
+        # MIS-124 R1: the read-only policy status rides beside the config.
+        self.assertIn("policy_status", body)
 
     def test_config_post_rejects_non_object_with_400(self):
         response = self.client.post(f"/ext/{self.prefix('config')}", json=[1, 2])
