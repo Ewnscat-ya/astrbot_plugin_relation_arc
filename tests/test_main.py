@@ -779,6 +779,30 @@ class RichChainStripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([Plain("可见回复。")], chain.chain)
         self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
 
+    async def test_leading_bare_json_split_across_parts_is_removed(self):
+        # MIS-117: a recovered bare verdict JSON split across two Plain parts
+        # must be removed from the outgoing chain, not just parsed.
+        chain = MessageChain([Plain('{"schema_version":3,'),
+                              Plain('"fact_effects":[{"effects":{"trust":2}}]}\nVisible reply')])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        self.assertEqual(["Visible reply"], [part.text for part in chain.chain])
+        self.assertEqual(402, self.plugin.store.account("qq-adapter:user-1", "global", "")["values"]["trust"])
+
+    async def test_truncated_tail_split_across_parts_is_removed(self):
+        # MIS-117: the second part of a truncated protocol tail must not leak
+        # into the outgoing chain either.
+        chain = MessageChain([Plain('Visible reply<relation_judgment>{"schema_version":3,'),
+                              Plain('"fact_effects":[')])
+        response = FakeResponse()
+        response.result_chain = chain
+        event = FakeEvent()
+        await self.plugin.judge(event, response)
+        self.assertEqual([Plain("Visible reply")], chain.chain)
+        self.assertEqual([], self.plugin.store.recent("qq-adapter:user-1", "global", ""))
+
 
 class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
     """MIS-117: repeat decay must key on the first fact's evidence (baseline

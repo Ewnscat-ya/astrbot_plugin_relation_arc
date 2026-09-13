@@ -360,25 +360,36 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # recovered by the parser and treated as protocol, never user-visible prose.
         has_protocol = bool(BLOCK.search(text) or (parsed.stats or {}).get("bare"))
         if plain_text.strip():
-            # The host's final result chain is the outgoing payload.  Strip each
-            # Plain part in place so component order (image between texts, a
-            # quote after text) survives protocol removal; only a protocol block
-            # split across parts falls back to squashing into the first slot.
+            # The host's final result chain is the outgoing payload. Strip in
+            # place so component order survives protocol removal, with the
+            # parse-level clean text as the single source of truth (MIS-117):
+            # a recovered bare-JSON span is located on the joined payload and
+            # mapped back onto its parts, and any per-part cleanup that still
+            # differs from the parser output (a block or truncated tail split
+            # across parts) falls back to squashing the clean text into the
+            # first slot.
             if has_protocol or parsed.clean_text != text.strip():
+                offsets = []
+                cursor = 0
+                for index, part in enumerate(plain_parts):
+                    if not part.text:
+                        continue
+                    offsets.append((index, cursor, cursor + len(part.text)))
+                    cursor += len(part.text) + 1  # "\n" join separator
                 cleaned_parts = [strip_protocol_text(part.text) for part in plain_parts]
                 if parsed.stats and parsed.stats.get("bare"):
-                    for index, part in enumerate(plain_parts):
-                        if not part.text.strip():
-                            continue
-                        span = leading_bare_json_span(part.text)
-                        if span:
-                            cleaned_parts[index] = (part.text[:span[0]] + part.text[span[1]:]).strip()
-                        break
+                    span = leading_bare_json_span(plain_text)
+                    if span:
+                        for index, start, end in offsets:
+                            if end <= span[0] or start >= span[1]:
+                                continue
+                            part_text = plain_parts[index].text
+                            local_start = max(0, span[0] - start)
+                            local_end = min(len(part_text), span[1] - start)
+                            cleaned_parts[index] = (part_text[:local_start] + part_text[local_end:]).strip()
                 joined_cleaned = "\n".join(cleaned_parts)
-                # Any surviving tag fragment (e.g. an opener removed here but
-                # closed in a later part) means the block spans parts: squash
-                # into the first slot, matching the pre-per-part contract.
-                if BLOCK.search(joined_cleaned) or "relation_judgment" in joined_cleaned:
+                if (BLOCK.search(joined_cleaned) or "relation_judgment" in joined_cleaned
+                        or joined_cleaned.strip() != parsed.clean_text.strip()):
                     replacement_done = False
                     new_chain = []
                     for part in result_chain.chain:
