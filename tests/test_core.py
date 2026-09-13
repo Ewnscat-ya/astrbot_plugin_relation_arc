@@ -794,6 +794,101 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "pre_restore" for item in store.list_backups()))
 
 
+class RestoreMigrationTests(unittest.TestCase):
+    """MIS-117: restoring an older-schema backup must migrate the live copy to
+    the current schema; silently leaving the live database on the old version
+    (broken scheduler_state, missing unique index) was the reported defect.
+
+    The old-schema backup is produced by the frozen planning-baseline
+    relation_store (dba500b, schema v9) loaded from git via importlib — no
+    exec, and no live plugin data. The baseline store predates the
+    future-version guard, so it only ever runs in its own isolated directory
+    and never opens the live database."""
+
+    BASELINE_COMMIT = "dba500bba2546391de4e4cdfbd99aa006635d7ca"
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        import shutil
+        import subprocess
+        import types
+        if shutil.which("git") is None:
+            raise unittest.SkipTest("git unavailable for baseline materialisation")
+        source = subprocess.check_output(
+            ["git", "-C", str(ROOT), "show", cls.BASELINE_COMMIT + ":relation_store.py"],
+            encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="relation_arc_baseline_src_") as staging:
+            module_file = Path(staging) / "baseline_relation_store.py"
+            module_file.write_text(source, encoding="utf-8")
+            package = types.ModuleType("relation_arc_restore_baseline")
+            package.__path__ = [str(ROOT)]
+            sys.modules.setdefault(package.__name__, package)
+            spec = importlib.util.spec_from_file_location(
+                package.__name__ + ".baseline_relation_store", module_file)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+        cls.baseline_cls = module.RelationStore
+        cls.baseline_version = module.SCHEMA_VERSION
+
+    def test_restore_of_baseline_v9_backup_migrates_live_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            baseline_store = self.baseline_cls(directory)
+            baseline_store.account("qq:v9", "global", "")
+            baseline_store.set_dimension("qq:v9", "global", "", "trust", 555)
+            backup = baseline_store.backup_now("manual")
+            probe = sqlite3.connect(backup)
+            try:
+                self.assertEqual(self.baseline_version, int(probe.execute("PRAGMA user_version").fetchone()[0]))
+            finally:
+                probe.close()
+
+            store = RelationStore(directory)
+            store.set_dimension("qq:v9", "global", "", "trust", 600)
+            result = store.restore_backup(backup.name, kind="manual")
+            self.assertTrue(result["migrated"])
+            self.assertEqual(SCHEMA_VERSION, result["schema_version"])
+            self.assertEqual(self.baseline_version, result["restored_from_version"])
+            # The live database really moved to the current schema.
+            with store._connection() as conn:
+                self.assertEqual(SCHEMA_VERSION, int(conn.execute("PRAGMA user_version").fetchone()[0]))
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_state'").fetchone())
+                self.assertTrue(conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_binding_unique_active_uq'").fetchone())
+            # Scheduler access must not raise, and restored data survived the migration.
+            self.assertIsNone(store.get_scheduler_state("decay_last_run"))
+            self.assertEqual(555, store.existing_account("qq:v9", "global", "")["values"]["trust"])
+
+    def test_restore_failure_during_migration_leaves_live_untouched(self):
+        import shutil
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            # Build the v9 backup in an isolated directory; the baseline store
+            # must never open the live database (no future-version guard there).
+            with tempfile.TemporaryDirectory() as baseline_dir:
+                baseline_store = self.baseline_cls(Path(baseline_dir))
+                baseline_store.account("qq:v9", "global", "")
+                backup = baseline_store.backup_now("manual")
+                (directory / "backups" / "manual").mkdir(parents=True)
+                shutil.copy2(backup, directory / "backups" / "manual" / backup.name)
+
+            store = RelationStore(directory)
+            store.account("qq:live", "global", "")
+            store.set_dimension("qq:live", "global", "", "trust", 600)
+            with mock.patch.object(store, "_apply_schema_ddl", side_effect=RuntimeError("injected ddl failure")):
+                with self.assertRaises(RuntimeError):
+                    store.restore_backup(backup.name, kind="manual")
+            # Live database still current, still holds its own data.
+            with store._connection() as conn:
+                self.assertEqual(SCHEMA_VERSION, int(conn.execute("PRAGMA user_version").fetchone()[0]))
+            self.assertEqual(600, store.existing_account("qq:live", "global", "")["values"]["trust"])
+            self.assertFalse(any(p.name.endswith(".restoring.tmp") for p in (directory / "backups" / "manual").iterdir()))
+
+
 class DecayPeriodTests(unittest.TestCase):
     """MIS-96: one decay per persisted period; floors and timestamps intact."""
 

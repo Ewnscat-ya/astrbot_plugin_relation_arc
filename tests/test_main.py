@@ -996,6 +996,65 @@ class BackupSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["scheduler"]["last_success"])
 
 
+class BackupFullSnapshotEntrypointTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-117: the managed cycle and the Pages manual entry both produce the
+    full snapshot group (sqlite + config copy + manifest) through their real
+    entrypoints, and auto rotation removes whole groups."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def _backup_dir(self, kind: str) -> Path:
+        return Path(self.temp.name) / "plugin_data" / "astrbot_plugin_relation_arc" / "backups" / kind
+
+    async def test_backup_cycle_entry_produces_full_group_and_rotates_group(self):
+        import os
+        auto_dir = self._backup_dir("auto")
+        auto_dir.mkdir(parents=True, exist_ok=True)
+        for suffix in (".sqlite3", ".config.json", ".manifest.json"):
+            (auto_dir / f"stale{suffix}").write_bytes(b"x")
+        old = time.time() - 5 * 3600
+        for suffix in (".sqlite3", ".config.json", ".manifest.json"):
+            os.utime(auto_dir / f"stale{suffix}", (old, old))
+        self.plugin.config["backup"]["retention_hours"] = 1
+        self.plugin._run_backup_cycle()
+        self.assertTrue(self.plugin._backup_state["last_success"])
+        self.assertIsNone(self.plugin._backup_state["last_error"])
+        files = {p.name for p in auto_dir.iterdir()}
+        self.assertTrue(any(name.endswith(".sqlite3") for name in files))
+        stem = next(name for name in files if name.endswith(".sqlite3"))[:-len(".sqlite3")]
+        self.assertIn(stem + ".config.json", files)
+        self.assertIn(stem + ".manifest.json", files)
+        manifest = json.loads((auto_dir / (stem + ".manifest.json")).read_text(encoding="utf-8"))
+        self.assertEqual("ok", manifest["integrity"])
+        self.assertEqual(11, manifest["schema_version"])
+        self.assertEqual(6, manifest["config_version"])
+        # The stale snapshot rotated as a whole group, companions included.
+        self.assertFalse(any(name.startswith("stale.") for name in files))
+
+    async def test_pages_manual_entry_produces_full_group(self):
+        from quart import Quart
+        app = Quart("manual-entry")
+        async with app.test_request_context("/backups", method="POST", json={"action": "backup_now"}):
+            response = await self.plugin._api_backups()
+            self.assertEqual(200, response.status_code)
+            payload = await response.get_json()
+        self.assertTrue(payload["success"])
+        manual_dir = self._backup_dir("manual")
+        files = {p.name for p in manual_dir.iterdir()}
+        stem = payload["name"][:-len(".sqlite3")]
+        self.assertIn(stem + ".config.json", files)
+        self.assertIn(stem + ".manifest.json", files)
+        manifest = json.loads((manual_dir / (stem + ".manifest.json")).read_text(encoding="utf-8"))
+        self.assertEqual("ok", manifest["integrity"])
+
+
 class ConfigAccountEditTests(unittest.IsolatedAsyncioTestCase):
     """MIS-99: explicit-only safety changes, revision conflicts, specific errors."""
 

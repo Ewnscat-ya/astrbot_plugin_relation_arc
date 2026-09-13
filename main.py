@@ -788,9 +788,10 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         return json.dumps(self.config.get("backup", {}), sort_keys=True)
 
     def _run_backup_cycle(self) -> None:
-        """MIS-95: one auto backup + retention rotation, with run status."""
+        """MIS-95/MIS-117: one full auto snapshot (sqlite + config + manifest)
+        + retention rotation, with run status."""
         backup=self.config["backup"]
-        path=self.store.backup_now("auto")
+        path=self._create_full_backup("auto")
         rotated=self.store.cleanup_auto_backups(int(backup["retention_hours"]))
         interval=max(1,int(backup["interval_hours"]))*3600
         self._backup_state.update({"last_run":time.time(),"last_success":True,"last_error":None,

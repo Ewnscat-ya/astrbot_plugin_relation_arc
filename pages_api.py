@@ -20,7 +20,9 @@ class PagesApiMixin:
         payload = await request.get_json()
         if not isinstance(payload, dict) or payload.get("action") != "backup_now":
             return jsonify({"error": "仅支持 backup_now"}), 400
-        path = self.store.backup_now("manual")
+        # MIS-117: the manual entry uses the same full snapshot (sqlite +
+        # config copy + manifest) as the managed auto cycle.
+        path = self._create_full_backup("manual")
         return jsonify({"success": True, "name": path.name, "kind": "manual"})
     async def _api_migrations(self):
         from quart import jsonify

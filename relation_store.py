@@ -95,44 +95,56 @@ class RelationStore:
             # change back, so an interrupted migration never leaves a
             # half-upgraded database behind.
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute("CREATE TABLE IF NOT EXISTS accounts (identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL DEFAULT '', values_json TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL, state_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(identity,scope_kind,scope_id))")
-            conn.execute("CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, source_kind TEXT NOT NULL, evidence TEXT NOT NULL, reason TEXT NOT NULL, requested_json TEXT NOT NULL, applied_json TEXT NOT NULL, notes_json TEXT NOT NULL, actor TEXT NOT NULL, created_at REAL NOT NULL)")
-            conn.execute("CREATE TABLE IF NOT EXISTS migration_log (id INTEGER PRIMARY KEY AUTOINCREMENT, component TEXT NOT NULL, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, backup_name TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)")
-            conn.execute("CREATE TABLE IF NOT EXISTS protocol_health (id INTEGER PRIMARY KEY AUTOINCREMENT, outcome TEXT NOT NULL, source TEXT NOT NULL, bare_recovery INTEGER NOT NULL DEFAULT 0, effect_count INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
-            # C1: automatic safety is separate from administrator-owned base state.
-            conn.execute("CREATE TABLE IF NOT EXISTS timed_safety (identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', level TEXT NOT NULL CHECK(level IN ('slow_down','pause_intimacy')), expires_at REAL NOT NULL, generation INTEGER NOT NULL, source TEXT NOT NULL CHECK(source='llm_auto'), created_at REAL NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(identity,scope_kind,scope_id))")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_timed_safety_expiry ON timed_safety(expires_at)")
-            # C4 is settlement-only: this table is never consulted by ordinary chat hooks.
-            conn.execute("CREATE TABLE IF NOT EXISTS settlement_blacklist (identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', reason_code TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(identity,scope_kind,scope_id))")
-            # B0: a separate ledger from accounts. It intentionally starts empty:
-            # only B2's validated same-turn proposal chain may create a binding.
-            conn.execute("CREATE TABLE IF NOT EXISTS relationship_bindings (binding_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','ended')), unique_scope TEXT NOT NULL DEFAULT '', origin_event_id TEXT NOT NULL DEFAULT '', state_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL, ended_at REAL)")
-            # MIS-96: persisted scheduler period markers (decay_last_run), so a
-            # restart or duplicate start can never apply the same period twice.
-            conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
-            # MIS-97: settlement window scans and health retention filter by
-            # these columns on every turn; without them events degrade to a
-            # full table scan as data grows.
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_window ON events(identity,scope_kind,scope_id,actor,created_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_protocol_health_created ON protocol_health(created_at)")
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
-            if "state_json" not in columns:
-                conn.execute("ALTER TABLE accounts ADD COLUMN state_json TEXT NOT NULL DEFAULT '{}'")
-            if "last_interaction" not in columns:
-                # C3 deliberately distinguishes accepted interaction time from any edit/read timestamp.
-                conn.execute("ALTER TABLE accounts ADD COLUMN last_interaction REAL NOT NULL DEFAULT 0")
-            if old_version < SCHEMA_VERSION:
-                conn.execute("INSERT INTO migration_log(component,from_version,to_version,backup_name,created_at) VALUES(?,?,?,?,?)", ("sqlite", old_version, SCHEMA_VERSION, migration_backup.name if migration_backup else "", time.time()))
-                self.migration_events.append({"component":"sqlite", "from_version":old_version, "to_version":SCHEMA_VERSION, "backup":migration_backup.name if migration_backup else ""})
-            # SQLite PRAGMA cannot bind parameters, so the version literal is
-            # written directly and verified against SCHEMA_VERSION on read-back;
-            # any drift fails loudly instead of silently mislabelling a database.
-            conn.execute("PRAGMA user_version=11")
-            written = conn.execute("PRAGMA user_version").fetchone()[0]
-            if written != SCHEMA_VERSION:
-                raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")
+            self._apply_schema_ddl(conn)
+            self._stamp_schema_version(conn, old_version, migration_backup.name if migration_backup else "")
+        self._ensure_unique_binding_index()
+
+    def _apply_schema_ddl(self, conn) -> None:
+        """Idempotent schema bring-up shared by fresh init and restore staging
+        (MIS-117): CREATE IF NOT EXISTS for every table and index plus the
+        column patches, safe to run on any copy from version 1 upward."""
+        conn.execute("CREATE TABLE IF NOT EXISTS accounts (identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL DEFAULT '', values_json TEXT NOT NULL, paused INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, updated_at REAL NOT NULL, state_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(identity,scope_kind,scope_id))")
+        conn.execute("CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, source_kind TEXT NOT NULL, evidence TEXT NOT NULL, reason TEXT NOT NULL, requested_json TEXT NOT NULL, applied_json TEXT NOT NULL, notes_json TEXT NOT NULL, actor TEXT NOT NULL, created_at REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS migration_log (id INTEGER PRIMARY KEY AUTOINCREMENT, component TEXT NOT NULL, from_version INTEGER NOT NULL, to_version INTEGER NOT NULL, backup_name TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS protocol_health (id INTEGER PRIMARY KEY AUTOINCREMENT, outcome TEXT NOT NULL, source TEXT NOT NULL, bare_recovery INTEGER NOT NULL DEFAULT 0, effect_count INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL)")
+        # C1: automatic safety is separate from administrator-owned base state.
+        conn.execute("CREATE TABLE IF NOT EXISTS timed_safety (identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', level TEXT NOT NULL CHECK(level IN ('slow_down','pause_intimacy')), expires_at REAL NOT NULL, generation INTEGER NOT NULL, source TEXT NOT NULL CHECK(source='llm_auto'), created_at REAL NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(identity,scope_kind,scope_id))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_timed_safety_expiry ON timed_safety(expires_at)")
+        # C4 is settlement-only: this table is never consulted by ordinary chat hooks.
+        conn.execute("CREATE TABLE IF NOT EXISTS settlement_blacklist (identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', reason_code TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(identity,scope_kind,scope_id))")
+        # B0: a separate ledger from accounts. It intentionally starts empty:
+        # only B2's validated same-turn proposal chain may create a binding.
+        conn.execute("CREATE TABLE IF NOT EXISTS relationship_bindings (binding_id TEXT PRIMARY KEY, identity TEXT NOT NULL, scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global','session')), scope_id TEXT NOT NULL DEFAULT '', type_key TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('active','ended')), unique_scope TEXT NOT NULL DEFAULT '', origin_event_id TEXT NOT NULL DEFAULT '', state_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL, updated_at REAL NOT NULL, ended_at REAL)")
+        # MIS-96: persisted scheduler period markers (decay_last_run), so a
+        # restart or duplicate start can never apply the same period twice.
+        conn.execute("CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value REAL NOT NULL)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_scope_status ON relationship_bindings(identity,scope_kind,scope_id,status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_binding_unique_active ON relationship_bindings(scope_kind,scope_id,unique_scope,status)")
+        # MIS-97: settlement window scans and health retention filter by
+        # these columns on every turn; without them events degrade to a
+        # full table scan as data grows.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_window ON events(identity,scope_kind,scope_id,actor,created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_protocol_health_created ON protocol_health(created_at)")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+        if "state_json" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN state_json TEXT NOT NULL DEFAULT '{}'")
+        if "last_interaction" not in columns:
+            # C3 deliberately distinguishes accepted interaction time from any edit/read timestamp.
+            conn.execute("ALTER TABLE accounts ADD COLUMN last_interaction REAL NOT NULL DEFAULT 0")
+
+    def _stamp_schema_version(self, conn, from_version: int, backup_name: str) -> None:
+        if from_version < SCHEMA_VERSION:
+            conn.execute("INSERT INTO migration_log(component,from_version,to_version,backup_name,created_at) VALUES(?,?,?,?,?)", ("sqlite", from_version, SCHEMA_VERSION, backup_name, time.time()))
+            self.migration_events.append({"component":"sqlite", "from_version":from_version, "to_version":SCHEMA_VERSION, "backup":backup_name})
+        # SQLite PRAGMA cannot bind parameters, so the version literal is
+        # written directly and verified against SCHEMA_VERSION on read-back;
+        # any drift fails loudly instead of silently mislabelling a database.
+        conn.execute("PRAGMA user_version=11")
+        written = conn.execute("PRAGMA user_version").fetchone()[0]
+        if written != SCHEMA_VERSION:
+            raise RuntimeError(f"schema version drift: user_version={written} != SCHEMA_VERSION={SCHEMA_VERSION}")
+
+    def _ensure_unique_binding_index(self) -> None:
         # MIS-92: exclusivity gets a database-level guarantee. Audit first: the
         # partial unique index below is constant literal DDL (SQLite DDL cannot
         # bind parameters) and is only created when no conflicting active rows
@@ -937,19 +949,30 @@ class RelationStore:
         return sorted(rows,key=lambda r:(r["mtime"],r["name"]),reverse=True)
 
     def cleanup_auto_backups(self, retention_hours: int) -> int:
+        """Rotate expired auto snapshots as whole groups: a full snapshot is a
+        sqlite file plus its same-stem config copy and manifest, so deleting
+        only the sqlite file would orphan the verification material. Only the
+        auto kind rotates; manual/migration/pre_restore stay protected."""
         cutoff=time.time()-max(1,retention_hours)*3600; cleaned=0
         for path in (self.backup_dir / "auto").glob("*.sqlite3"):
-            if path.stat().st_mtime < cutoff: path.unlink(); cleaned+=1
+            if path.stat().st_mtime < cutoff:
+                path.unlink(); cleaned+=1
+                for companion in (path.with_suffix(".config.json"), path.with_suffix(".manifest.json")):
+                    companion.unlink(missing_ok=True)
         return cleaned
 
     def restore_backup(self, name: str, kind: str = "manual") -> dict[str, Any]:
-        """MIS-95: prechecked, transactional restore via the SQLite backup API.
+        """MIS-95/MIS-117: prechecked restore via the SQLite backup API.
 
         The source must pass an integrity check and carry a supported schema
         version (1..SCHEMA_VERSION) or it is rejected before the live database
-        is touched. A protected pre_restore snapshot is taken first; the
-        restore copies page-by-page inside the lock, so a failure leaves the
-        live database exactly as it was (WAL handled by SQLite itself)."""
+        is touched. An older-schema backup is first migrated on a temporary
+        staging copy (shared idempotent schema bring-up, migration log, version
+        stamp with read-back verification, then an integrity check); only a
+        fully verified staging copy replaces the live database, and the
+        protected pre_restore snapshot is taken right before that final copy.
+        Any earlier failure therefore leaves the live database exactly as it
+        was, and a restored copy always ends at the current schema."""
         if kind not in BACKUP_KINDS: raise ValueError("unknown backup kind")
         source=(self.backup_dir/kind/Path(name).name).resolve(); parent=(self.backup_dir/kind).resolve()
         if source.parent != parent or not source.is_file(): raise ValueError("backup not found")
@@ -966,9 +989,57 @@ class RelationStore:
             raise ValueError(f"backup failed integrity check: {integrity}")
         if not 1 <= version <= SCHEMA_VERSION:
             raise ValueError(f"unsupported backup schema version {version}; this build supports 1..{SCHEMA_VERSION}")
-        self.backup_now("pre_restore")
-        self._copy_into_live(source)
-        return {"schema_version": version, "integrity": "ok"}
+        staging=source.with_name(source.stem + ".restoring.tmp")
+        try:
+            self._materialize_staging(source, staging)
+            self._migrate_staging(staging, from_version=version, backup_name=source.name)
+            self._verify_staging(staging)
+            self.backup_now("pre_restore")
+            self._copy_into_live(staging)
+            # The exclusivity index is created outside the plain DDL pass (its
+            # conflicts are audited, never deleted), so re-ensure it on the
+            # restored database too.
+            self._ensure_unique_binding_index()
+            return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
+                    "integrity": "ok", "migrated": version < SCHEMA_VERSION}
+        finally:
+            staging.unlink(missing_ok=True)
+
+    def _materialize_staging(self, source: Path, staging: Path) -> None:
+        """Copy the verified backup file onto a staging path via the backup API."""
+        with self.lock:
+            source_conn=sqlite3.connect(source)
+            staging_conn=sqlite3.connect(staging)
+            try:
+                source_conn.backup(staging_conn)
+            finally:
+                staging_conn.close(); source_conn.close()
+
+    def _migrate_staging(self, staging: Path, *, from_version: int, backup_name: str) -> None:
+        conn=sqlite3.connect(staging, timeout=10)
+        conn.row_factory=sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._apply_schema_ddl(conn)
+            self._stamp_schema_version(conn, from_version, backup_name)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _verify_staging(self, staging: Path) -> None:
+        probe=sqlite3.connect(staging)
+        try:
+            integrity=probe.execute("PRAGMA integrity_check").fetchone()[0]
+            version=int(probe.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            probe.close()
+        if integrity != "ok":
+            raise ValueError(f"migrated restore staging copy failed integrity check: {integrity}")
+        if version != SCHEMA_VERSION:
+            raise ValueError(f"migrated restore staging copy has unexpected schema version {version}")
 
     def _copy_into_live(self, source: Path) -> None:
         """Page-by-page copy from a backup file into the live database."""
