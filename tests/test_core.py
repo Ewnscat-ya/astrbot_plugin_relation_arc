@@ -195,11 +195,14 @@ class RelationArcCoreTests(unittest.TestCase):
             config_path.write_text(json.dumps({"config_version": 4, "is_global_relation": False, "initial_values": {"trust": 450}}), encoding="utf-8")
             mgr = PluginConfigManager(root, root)
             config = mgr.load_or_create()
-            self.assertEqual(6, config["config_version"])
+            self.assertEqual(7, config["config_version"])
             self.assertFalse(config["is_global_relation"])
             self.assertEqual(450, config["initial_values"]["trust"])
             self.assertIn("protocol_health", config)
-            self.assertEqual(1, len(list((config_path.parent / "backups" / "migration").glob("config_v4_to_v6_*.json"))))
+            # MIS-124 R1: a pre-v7 file migrates to the legacy binding policy.
+            self.assertEqual("scope", config["binding_policy"]["exclusivity"])
+            self.assertEqual("legacy", config["binding_policy_source"]["exclusivity"])
+            self.assertEqual(1, len(list((config_path.parent / "backups" / "migration").glob("config_v4_to_v7_*.json"))))
 
     def test_v5_schema_migration_preserves_ledger_and_creates_protected_backup(self):
         import sqlite3
@@ -337,7 +340,9 @@ class SchemaVersionGuardTests(unittest.TestCase):
             store.account("qq:keep", "global", "")
             db_path = Path(directory) / "relation_arc.sqlite3"
             raw = sqlite3.connect(db_path)
-            raw.execute("PRAGMA user_version=12")
+            # Literal PRAGMA (cannot bind); 13 == SCHEMA_VERSION + 1 in this
+            # tree - a future schema bump must move this literal with it.
+            raw.execute("PRAGMA user_version=13")
             raw.commit()
             raw.close()
             with self.assertRaises(ValueError) as ctx:
@@ -347,7 +352,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
             version = check.execute("PRAGMA user_version").fetchone()[0]
             kept = check.execute("SELECT identity FROM accounts WHERE identity='qq:keep'").fetchone()
             check.close()
-            self.assertEqual(12, version)
+            self.assertEqual(SCHEMA_VERSION + 1, version)
             self.assertIsNotNone(kept)
 
     def test_corrupt_database_refused_and_preserved(self):
@@ -743,7 +748,8 @@ class BackupRestoreTests(unittest.TestCase):
                     raw.close()
                     backup_file.write_bytes(b"junk" * 512)
                 elif case == "future":
-                    raw.execute("PRAGMA user_version=12")
+                    # Literal PRAGMA (cannot bind); 13 == SCHEMA_VERSION + 1 here.
+                    raw.execute("PRAGMA user_version=13")
                     raw.commit(); raw.close()
                 else:
                     raw.execute("PRAGMA user_version=0")
@@ -792,6 +798,85 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertEqual(before_revision, after["revision"])
             # The pre-restore snapshot exists for manual recovery.
             self.assertTrue(any(item["kind"] == "pre_restore" for item in store.list_backups()))
+
+
+class BindingPolicyConfigTests(unittest.TestCase):
+    """MIS-124 R1: binding_policy is an explicit product choice. Fresh
+    installs default to both options off; a pre-v7 config migrates to the
+    0eb5859 behaviour (scope / type_default) with a recorded legacy source;
+    an explicit value always wins and migrations are idempotent."""
+
+    def _load(self, directory: Path, raw: dict | None):
+        from astrbot_plugin_relation_arc.config_manager import CONFIG_VERSION, PluginConfigManager
+        manager = PluginConfigManager(Path(directory), Path(directory))
+        if raw is not None:
+            manager.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        return CONFIG_VERSION, manager, manager.load_or_create()
+
+    def test_fresh_install_defaults_off_with_default_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, config = self._load(Path(directory), None)
+            self.assertEqual("none", config["binding_policy"]["exclusivity"])
+            self.assertEqual("off", config["binding_policy"]["rebind_cooldown"])
+            self.assertEqual({"exclusivity": "default", "rebind_cooldown": "default"},
+                             config["binding_policy_source"])
+
+    def test_pre_v7_config_migrates_to_legacy_behaviour_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, manager, config = self._load(Path(directory), {"config_version": 6, "enabled": True})
+            self.assertEqual(7, config["config_version"])
+            self.assertEqual("scope", config["binding_policy"]["exclusivity"])
+            self.assertEqual("type_default", config["binding_policy"]["rebind_cooldown"])
+            self.assertEqual({"exclusivity": "legacy", "rebind_cooldown": "legacy"},
+                             config["binding_policy_source"])
+            self.assertTrue(manager.migration_events)
+            # Reloading the migrated v7 file keeps values and source untouched.
+            _, _, again = self._load(Path(directory), None)
+            self.assertEqual(config["binding_policy"], again["binding_policy"])
+            self.assertEqual(config["binding_policy_source"], again["binding_policy_source"])
+
+    def test_explicit_choice_survives_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, config = self._load(Path(directory), {
+                "config_version": 6, "enabled": True,
+                "binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            self.assertEqual("none", config["binding_policy"]["exclusivity"])
+            self.assertEqual("off", config["binding_policy"]["rebind_cooldown"])
+            self.assertEqual({"exclusivity": "admin", "rebind_cooldown": "admin"},
+                             config["binding_policy_source"])
+
+    def test_invalid_enum_rejected_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            from astrbot_plugin_relation_arc.config_manager import PluginConfigManager
+            manager = PluginConfigManager(directory, directory)
+            raw = {"config_version": 7, "binding_policy": {"exclusivity": "everyone", "rebind_cooldown": "off"}}
+            manager.path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                manager.load_or_create()
+            # The malformed file is still on disk, never replaced by defaults.
+            self.assertEqual("everyone", json.loads(manager.path.read_text(encoding="utf-8"))["binding_policy"]["exclusivity"])
+
+    def test_future_config_version_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            from astrbot_plugin_relation_arc.config_manager import PluginConfigManager
+            manager = PluginConfigManager(Path(directory), Path(directory))
+            manager.path.write_text(json.dumps({"config_version": 99}, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                manager.load_or_create()
+
+    def test_pages_update_marks_only_changed_keys_as_admin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, manager, config = self._load(Path(directory), None)
+            # Fresh defaults are none/off; changing both values marks both.
+            manager.update({"binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"}})
+            self.assertEqual("admin", config["binding_policy_source"]["exclusivity"])
+            self.assertEqual("admin", config["binding_policy_source"]["rebind_cooldown"])
+            # Re-saving the same value keeps the explicit source; it never
+            # flips untouched fields back to default.
+            manager.update({"binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"}})
+            self.assertEqual({"exclusivity": "admin", "rebind_cooldown": "admin"},
+                             config["binding_policy_source"])
 
 
 class RestoreMigrationTests(unittest.TestCase):
