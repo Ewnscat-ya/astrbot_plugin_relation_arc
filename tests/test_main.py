@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import time
@@ -874,6 +875,172 @@ class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_different_first_evidence_does_not_decay_on_signature(self):
         self.assertEqual([10, 10], await self._deltas([("first-A", "later"), ("first-B", "later")]))
+
+
+class UpgradeCooldownTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-126 R3: the backend recognises a mutual bind/spouse proposal for an
+    identity with one active romantic_partner as an atomic upgrade; the
+    replaced partner row is marked upgraded (never a breakup), the target
+    type's real cooldown still applies when the policy enables it, and any
+    failure rolls the whole turn back."""
+
+    SPOUSE_READY = {"trust": 850, "respect": 750, "comfort": 850,
+                    "closeness": 850, "resonance": 750, "romance_interest": 850}
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.identity = "qq-adapter:user-1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def _prime(self):
+        for key, value in self.SPOUSE_READY.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="shown", romance_state="eligible")
+
+    def _add_partner(self, event_id="partner-1"):
+        binding = {"binding_id": event_id, "type_key": "romantic_partner", "unique_scope": "romance",
+                   "origin": "test", "summary": ""}
+        status = self.plugin.store.apply_turn_with_binding(
+            event_id="evt-" + event_id, identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding)[1]
+        self.assertEqual("binding_created", status)
+        return event_id
+
+    async def _propose_spouse(self, event_id, effects=None, with_proposal=True):
+        payload = {"schema_version": 3,
+                   "fact_effects": [{"effects": effects}] if effects else [],
+                   "relationship_proposal": ({"action": "bind", "type_id": "spouse",
+                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                              "summary": "彼此确认"} if with_proposal else None)}
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": event_id})()
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        rows = self.plugin.store.list_bindings(status="active")
+        return [row for row in rows if row["identity"] == self.identity and row["type_key"] == "spouse"]
+
+    def _set_cooldown(self, enabled: bool):
+        self.plugin.config["binding_policy"]["rebind_cooldown"] = "type_default" if enabled else "off"
+        self.plugin.store.activate_binding_policy(self.plugin.config["binding_policy"])
+
+    def _seed_ended_spouse(self, ended_at: float, end_reason: str = ""):
+        raw = sqlite3.connect(Path(self.temp.name) / "plugin_data" / "astrbot_plugin_relation_arc" / "relation_arc.sqlite3")
+        raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES('old-spouse',?,'global','','spouse','ended','romance','seed','{}',1,1,?,?)", (self.identity, ended_at, end_reason))
+        raw.commit()
+        raw.close()
+
+    async def test_legal_upgrade_replaces_partner_atomically(self):
+        self._prime()
+        self._add_partner()
+        spouse = await self._propose_spouse("up-1", effects={"trust": 2, "romance_interest": 2})
+        self.assertEqual(1, len(spouse))
+        bindings = {row["type_key"]: row for row in self.plugin.store.list_bindings()}
+        self.assertEqual("active", bindings["spouse"]["status"])
+        self.assertEqual("ended", bindings["romantic_partner"]["status"])
+        self.assertEqual("upgraded", bindings["romantic_partner"]["end_reason"])
+        self.assertEqual(spouse[0]["binding_id"], json.loads(bindings["romantic_partner"]["state_json"]).get("upgraded_to"))
+        # The audit event carries the upgrade marker with the old binding id.
+        notes = json.loads(self.plugin.store.recent(self.identity, "global", "")[0]["notes_json"])
+        self.assertIn("binding_upgraded:romantic_partner->spouse", notes["binding"]["notes"])
+        self.assertEqual("partner-1", notes["binding"]["upgraded_from"])
+
+    async def test_upgrade_without_score_changes_still_processes(self):
+        self._prime()
+        self._add_partner()
+        spouse = await self._propose_spouse("up-empty", effects=None)
+        self.assertEqual(1, len(spouse))
+        partner = [row for row in self.plugin.store.list_bindings() if row["type_key"] == "romantic_partner"][0]
+        self.assertEqual("upgraded", partner["end_reason"])
+
+    async def test_no_partner_direct_spouse_still_binds(self):
+        self._prime()
+        spouse = await self._propose_spouse("direct-1", effects=None)
+        self.assertEqual(1, len(spouse))
+        self.assertEqual([], [row for row in self.plugin.store.list_bindings() if row["type_key"] == "romantic_partner"])
+
+    async def test_below_threshold_rejects_and_keeps_partner(self):
+        self._prime()
+        self.plugin.store.set_dimension(self.identity, "global", "", "trust", 800)
+        self._add_partner()
+        spouse = await self._propose_spouse("low-1", effects=None)
+        self.assertEqual([], spouse)
+        bindings = {row["type_key"]: row["status"] for row in self.plugin.store.list_bindings()}
+        self.assertEqual("active", bindings["romantic_partner"])
+        self.assertNotIn("spouse", bindings)
+
+    async def test_replay_never_upgrades_twice(self):
+        self._prime()
+        self._add_partner()
+        await self._propose_spouse("replay-1", effects=None)
+        await self._propose_spouse("replay-1", effects=None)
+        self.assertEqual(1, len([row for row in self.plugin.store.list_bindings() if row["type_key"] == "spouse"]))
+        self.assertEqual(1, len([row for row in self.plugin.store.list_bindings() if row["status"] == "active"]))
+
+    def _seed_ended_spouse(self, ended_at: float, end_reason: str = ""):
+        raw = sqlite3.connect(Path(self.temp.name) / "plugin_data" / "astrbot_plugin_relation_arc" / "relation_arc.sqlite3")
+        raw.execute("INSERT INTO relationship_bindings(binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason) VALUES('old-spouse',?,'global','','spouse','ended','romance','seed','{}',1,1,?,?)", (self.identity, ended_at, end_reason))
+        raw.commit()
+        raw.close()
+
+    async def test_target_spouse_real_cooldown_blocks_upgrade(self):
+        self._prime()
+        self._add_partner()
+        self._set_cooldown(True)
+        self._seed_ended_spouse(time.time() - 100 * 3600)  # well inside 336h
+        spouse = await self._propose_spouse("cd-1", effects=None)
+        self.assertEqual([], spouse)
+        bindings = {row["type_key"]: row["status"] for row in self.plugin.store.list_bindings()}
+        self.assertEqual("active", bindings["romantic_partner"])
+
+    async def test_cooldown_off_skips_the_wait(self):
+        self._prime()
+        self._add_partner()
+        self._set_cooldown(False)
+        self._seed_ended_spouse(time.time() - 1 * 3600)
+        spouse = await self._propose_spouse("cd-2", effects=None)
+        self.assertEqual(1, len(spouse))
+
+    async def test_upgraded_partner_end_never_seeds_breakup_cooldown(self):
+        self._prime()
+        self._add_partner()
+        self._set_cooldown(True)
+        await self._propose_spouse("up-cd", effects=None)
+        # Real end of the spouse by the administrator.
+        spouse_id = self.plugin.store.active_bindings_for(self.identity, "global", "")[0]["binding_id"]
+        self.assertTrue(self.plugin.store.end_binding(spouse_id, "admin"))
+        # Rebinding romantic_partner: the upgraded partner end is not a
+        # breakup, so no 168h partner cooldown applies.
+        binding = {"binding_id": "partner-2", "type_key": "romantic_partner", "unique_scope": "romance",
+                   "origin": "test", "summary": ""}
+        status = self.plugin.store.apply_turn_with_binding(
+            event_id="evt-partner-2", identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="test", evidence="", reason="", requested={}, applied={}, notes={}, binding=binding)[1]
+        self.assertEqual("binding_created", status)
+
+    async def test_exactly_expired_spouse_cooldown_allows_upgrade(self):
+        self._prime()
+        self._add_partner()
+        self._set_cooldown(True)
+        self._seed_ended_spouse(time.time() - (336 * 3600 + 5))
+        spouse = await self._propose_spouse("cd-3", effects=None)
+        self.assertEqual(1, len(spouse))
+
+    async def test_admin_ending_partner_before_upgrade_yields_direct_bind(self):
+        self._prime()
+        self._add_partner()
+        self.assertTrue(self.plugin.store.end_binding("partner-1", "admin"))
+        spouse = await self._propose_spouse("comp-1", effects=None)
+        self.assertEqual(1, len(spouse))
+
+    async def test_admin_end_after_upgrade_reports_not_active(self):
+        self._prime()
+        self._add_partner()
+        await self._propose_spouse("comp-2", effects=None)
+        self.assertFalse(self.plugin.store.end_binding("partner-1", "admin"))
 
 
 class JudgeEpochPolicyTests(unittest.IsolatedAsyncioTestCase):

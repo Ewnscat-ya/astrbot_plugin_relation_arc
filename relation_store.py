@@ -294,12 +294,17 @@ class RelationStore:
     def _legacy_conflict_exists(self, conn, identity: str, scope_kind: str, scope_id: str) -> bool:
         return bool(conn.execute("SELECT 1 FROM binding_conflicts WHERE identity=? AND scope_kind=? AND scope_id=? LIMIT 1", (identity, scope_kind, scope_id)).fetchone())
 
-    def _admit_binding(self, conn, binding: dict[str, Any] | None, identity: str, scope_kind: str, scope_id: str, active_policy: sqlite3.Row, expected_epoch: int | None) -> tuple[dict[str, Any] | None, str]:
+    def _admit_binding(self, conn, binding: dict[str, Any] | None, identity: str, scope_kind: str, scope_id: str, active_policy: sqlite3.Row, expected_epoch: int | None, allow_romance_replace: bool = False) -> tuple[dict[str, Any] | None, str]:
         """MIS-125 R2: shared in-transaction admission ladder for every
         binding write path (settlement, store primitive, legacy migration).
         Order: legacy conflicts -> stale policy epoch -> cross-user romance
         exclusion (active policy only) -> same-user romance level -> same-type
-        duplicate. Returns (binding_or_None, status)."""
+        duplicate. Returns (binding_or_None, status).
+
+        ``allow_romance_replace`` (MIS-126 R3) marks the one legitimate
+        romance-tier transition: the backend-recognised upgrade of the
+        caller's own active romantic_partner to spouse. Every other tier
+        change stays rejected."""
         if binding is None:
             return None, "no_binding"
         if self._legacy_conflict_exists(conn, identity, scope_kind, scope_id):
@@ -312,7 +317,7 @@ class RelationStore:
             if conn.execute("SELECT 1 FROM relationship_bindings WHERE scope_kind=? AND scope_id=? AND status='active' AND type_key IN ('romantic_partner','spouse') AND identity<>? LIMIT 1", (scope_kind, scope_id, identity)).fetchone():
                 return None, "binding_rejected:exclusive"
         own_romance = conn.execute("SELECT type_key FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND status='active' AND type_key IN ('romantic_partner','spouse') LIMIT 1", (identity, scope_kind, scope_id)).fetchone()
-        if is_romance and own_romance is not None and own_romance["type_key"] != binding["type_key"]:
+        if is_romance and own_romance is not None and own_romance["type_key"] != binding["type_key"] and not allow_romance_replace:
             # A lower romance tier can never silently replace a higher one.
             return None, "binding_rejected:romance_occupied"
         if conn.execute("SELECT 1 FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='active' LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone():
@@ -703,19 +708,48 @@ class RelationStore:
             # rebind cooldown all follow the shared admission ladder.
             active_policy = self._active_policy_row(conn)
             binding_status = "no_binding"
+            # MIS-126 R3: a natural, mutual bind/spouse proposal for an
+            # identity that already holds exactly one active romantic_partner
+            # is recognised by the backend as an upgrade candidate. No new
+            # protocol action, no forced ladder, no manual confirmation.
+            upgrade_of = None
+            if binding is not None and binding["type_key"] == "spouse":
+                own_partner = conn.execute("SELECT binding_id FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key='romantic_partner' AND status='active' LIMIT 1", (identity, scope_kind, scope_id)).fetchone()
+                upgrade_of = own_partner["binding_id"] if own_partner else None
             if binding:
-                binding, binding_status = self._admit_binding(conn, binding, identity, scope_kind, scope_id, active_policy, policy.get("expected_epoch"))
+                binding, admission = self._admit_binding(conn, binding, identity, scope_kind, scope_id, active_policy, policy.get("expected_epoch"), allow_romance_replace=upgrade_of is not None)
                 if binding is None:
-                    notes = {**notes, "binding": {"notes": [binding_status]}}
+                    binding_status = admission
+                    notes = {**notes, "binding": {"notes": [admission]}}
+                elif upgrade_of:
+                    # Upgrade: the target type's REAL cooldown still applies
+                    # when the policy enables it - an ended-spouse record
+                    # within its window rejects the upgrade and keeps the
+                    # current partner untouched.
+                    if active_policy["rebind_cooldown"] == "type_default":
+                        cooldown_hours = int((policy.get("type_cooldown_hours") or {}).get("spouse", 0))
+                        last_real = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key='spouse' AND status='ended' AND (end_reason IS NULL OR end_reason<>'upgraded') ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id)).fetchone()
+                        if (cooldown_hours > 0 and last_real is not None and last_real["ended_at"] is not None
+                                and now - float(last_real["ended_at"]) < cooldown_hours * 3600):
+                            binding = None
+                            notes = {**notes, "binding": {"notes": ["binding_rejected:cooldown"]}}
+                            binding_status = "binding_rejected:cooldown"
+                    if binding is not None:
+                        # Atomic replacement: the partner row ends with the
+                        # explicit upgraded marker (never a breakup, never a
+                        # cooldown seed) and links forward to the new binding.
+                        conn.execute("UPDATE relationship_bindings SET status='ended',ended_at=?,updated_at=?,end_reason='upgraded',state_json=json_set(state_json,'$.upgraded_to',?) WHERE binding_id=?", (now, now, binding["binding_id"], upgrade_of))
+                        binding_status = "binding_upgraded"
+                        notes = {**notes, "binding": {"notes": ["binding_upgraded:romantic_partner->spouse"], "upgraded_from": upgrade_of}}
                 elif active_policy["rebind_cooldown"] == "type_default":
                     # MIS-94: type cooldown counts from the latest ended_at of
                     # the same identity/type/scope; ended history is kept and
                     # only the most recent one decides. Durations come from the
-                    # caller's single type directory via policy; the cooldown
-                    # itself is now policy-gated (R3: upgraded replacements
-                    # never start one).
+                    # caller's single type directory via policy. Ends carrying
+                    # the upgraded marker were replacements, not breakups, and
+                    # never seed a cooldown (R3).
                     cooldown_hours = int((policy.get("type_cooldown_hours") or {}).get(binding["type_key"], 0))
-                    last_ended = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='ended' ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone()
+                    last_ended = conn.execute("SELECT ended_at FROM relationship_bindings WHERE identity=? AND scope_kind=? AND scope_id=? AND type_key=? AND status='ended' AND (end_reason IS NULL OR end_reason<>'upgraded') ORDER BY ended_at DESC LIMIT 1", (identity, scope_kind, scope_id, binding["type_key"])).fetchone()
                     if (cooldown_hours > 0 and last_ended is not None and last_ended["ended_at"] is not None
                             and now - float(last_ended["ended_at"]) < cooldown_hours * 3600):
                         binding = None
@@ -848,16 +882,16 @@ class RelationStore:
         """B0 management query. No write method exists until B2 validation ships."""
         # Fully literal branch queries: every clause is a compile-time constant.
         if scope_kind in {"global", "session"} and status in {"active", "ended"}:
-            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE scope_kind=? AND status=? ORDER BY updated_at DESC LIMIT ?"
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason FROM relationship_bindings WHERE scope_kind=? AND status=? ORDER BY updated_at DESC LIMIT ?"
             args: list[Any]=[scope_kind,status]
         elif scope_kind in {"global", "session"}:
-            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE scope_kind=? ORDER BY updated_at DESC LIMIT ?"
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason FROM relationship_bindings WHERE scope_kind=? ORDER BY updated_at DESC LIMIT ?"
             args=[scope_kind]
         elif status in {"active", "ended"}:
-            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings WHERE status=? ORDER BY updated_at DESC LIMIT ?"
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason FROM relationship_bindings WHERE status=? ORDER BY updated_at DESC LIMIT ?"
             args=[status]
         else:
-            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,created_at,updated_at,ended_at FROM relationship_bindings ORDER BY updated_at DESC LIMIT ?"
+            query="SELECT binding_id,identity,scope_kind,scope_id,type_key,status,unique_scope,origin_event_id,state_json,created_at,updated_at,ended_at,end_reason FROM relationship_bindings ORDER BY updated_at DESC LIMIT ?"
             args=[]
         args.append(max(1,min(limit,500)))
         with self.lock, self._connection() as conn:
