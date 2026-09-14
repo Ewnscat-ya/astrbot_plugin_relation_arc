@@ -522,14 +522,26 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             logger.info("[关系弧线] settlement=zero_after_policy binding=%s", info.get("binding_reason"))
             return
         binding_status = info.get("status", "no_binding")
-        # MIS-134 C07: a pure rejection receipt is never reported as applied.
-        settlement_outcome = "binding_rejected" if str(binding_status).startswith("binding_rejected") else "applied"
+        # MIS-134 R02/R03: classification follows the WHOLE turn's actual
+        # result — real score/safety/binding success is "applied"; a binding
+        # rejection with no actual change is "binding_rejected". Both are
+        # recorded; neither is silently dropped. info["applied"] already
+        # carries the actual deltas (paused turns report {}).
+        actual_applied = info.get("applied", {}) or {}
+        actual_action = bool(actual_applied) or info.get("timed_safety") is not None             or binding_status in ("binding_created", "binding_upgraded")
+        if str(binding_status).startswith("binding_rejected") and not actual_action:
+            settlement_outcome = "binding_rejected"
+        elif not actual_action:
+            # A paused receipt or otherwise change-less committed round.
+            settlement_outcome = "zero_after_policy"
+        else:
+            settlement_outcome = "applied"
         self._record_health(settlement_outcome, text_source, parsed)
         blacklist=self.config.get("auto_blacklist",{})
         if blacklist.get("enabled") and self.store.settlement_event_count(identity,scope_kind,scope_id) >= int(blacklist["settlement_limit"]):
             self.store.blacklist_settlement(identity,scope_kind,scope_id,"settlement_limit")
             logger.info("[关系弧线] settlement=blacklist_added")
-        logger.info("[关系弧线] settlement=%s dimensions=%s binding=%s", settlement_outcome, ",".join(sorted(key for key,value in info.get("applied", {}).items() if value)), binding_status)
+        logger.info("[关系弧线] settlement=%s dimensions=%s binding=%s", settlement_outcome, ",".join(sorted(key for key,value in actual_applied.items() if value)), binding_status)
 
 
     # MIS-117: decorated chat entries live in this class body. The host
@@ -770,12 +782,19 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             except (ValueError, TypeError):
                 binding_notes = []
             for note in binding_notes:
-                if note == "binding_upgraded:romantic_partner->spouse":
-                    binding_result = "；正式关系已升级" + ("：恋人 → 此生挚爱" if romance_visible else "")
-                elif note == "binding_created:spouse":
-                    binding_result = "；正式关系建立" + ("：此生挚爱" if romance_visible else "")
-                elif note == "binding_created:romantic_partner":
-                    binding_result = "；正式关系建立" + ("：恋人" if romance_visible else "")
+                # MIS-134 R04/R05: every creation names its type via the fixed
+                # directory; the hiding projection applies to the EVENT
+                # MEANING, not just the trailing tier name — a romance-tier
+                # build or the unique upgrade edge leaves no identifiable
+                # marker in groups or hidden private chats, while rejection
+                # reasons (tier-free protocol codes) stay visible.
+                if note.startswith("binding_created:"):
+                    rel_type = get_type(note.split(":", 1)[1])
+                    if rel_type and (rel_type.category != "romance" or romance_visible):
+                        binding_result = f"；正式关系建立：{rel_type.label}"
+                elif note == "binding_upgraded:romantic_partner->spouse":
+                    if romance_visible:
+                        binding_result = "；正式关系已升级：恋人 → 此生挚爱"
                 elif note.startswith("binding_rejected:"):
                     binding_result = "；关系提案未通过（" + note.split(":", 1)[1] + "）"
             lines.append(f"- {shown or '无变化'}{suffix}{binding_result}")

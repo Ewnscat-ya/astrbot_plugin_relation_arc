@@ -1418,6 +1418,167 @@ class ConfigSourceWriteGuardTests(unittest.IsolatedAsyncioTestCase):
                          self.plugin.config["binding_policy_source"])
 
 
+class HealthClassificationTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 R02/R03: settlement health follows the WHOLE turn's actual
+    result — a pure rejection receipt lands in binding_rejected (never
+    dropped, never applied), a scored-but-rejected turn stays applied, and a
+    paused account's receipt reports no phantom deltas."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.identity = "qq-adapter:user-1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    def _buckets(self):
+        summary = self.plugin.store.protocol_health_summary()
+        return {b["outcome"]: b["count"] for b in summary["buckets"]}
+
+    async def test_pure_receipt_counted_as_binding_rejected(self):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "hc-1"})()
+        self.plugin.store.set_dimension(self.identity, "global", "", "trust", 600)
+        self.plugin._pin_turn_context(event)
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        payload = {"schema_version": 3, "fact_effects": [],
+                   "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                             "origin": "user_request", "mutuality": "clear",
+                                             "summary": "s"}}
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        buckets = self._buckets()
+        self.assertGreaterEqual(buckets.get("binding_rejected", 0), 1)
+
+    async def test_scored_but_rejected_still_applied(self):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "hc-2"})()
+        self.plugin._pin_turn_context(event)
+        self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+        payload = {"schema_version": 3, "fact_effects": [{"effects": {"trust": 4}}],
+                   "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                             "origin": "user_request", "mutuality": "clear",
+                                             "summary": "s"}}
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+        buckets = self._buckets()
+        self.assertGreaterEqual(buckets.get("applied", 0), 1)
+        self.assertEqual(404, self.plugin.store.existing_account(self.identity, "global", "")["values"]["trust"])
+        self.assertEqual([], self.plugin.store.active_bindings_for(self.identity, "global", ""))
+
+    async def test_paused_rejected_receipt_reports_no_phantom_score(self):
+        for key, value in {"trust": 850, "respect": 750, "comfort": 850,
+                           "closeness": 850, "resonance": 750, "romance_interest": 850}.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="shown", romance_state="eligible")
+        self.plugin.store.apply_turn_with_binding(
+            event_id="evt-p", identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={}, notes={},
+            binding={"binding_id": "partner-1", "type_key": "romantic_partner", "unique_scope": "romance",
+                     "origin": "test", "summary": ""})
+        self.plugin.store.set_paused(self.identity, "global", "", True)
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": "hc-3"})()
+        await self.plugin.judge(event, FakeResponse(
+            '<relation_judgment>' + json.dumps({
+                "schema_version": 3, "fact_effects": [{"effects": {"trust": 2}}]}) + '</relation_judgment>好的。'))
+        # 850 + accepted(1, edge-saturated) rejected by pause: actual value
+        # unchanged, health binding_rejected (never applied, never dropped).
+        self.assertEqual(850, self.plugin.store.existing_account(self.identity, "global", "")["values"]["trust"])
+        buckets = self._buckets()
+        self.assertGreaterEqual(buckets.get("zero_after_policy", 0), 1)
+        self.assertEqual(0, buckets.get("applied", 0))
+
+
+class CreationDisplayTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-134 R04/R05: creation shows all five type labels; the hiding
+    projection applies to the EVENT MEANING — groups and hidden private
+    chats never show a romance build or the unique upgrade marker."""
+
+    SPOUSE_READY = {"trust": 850, "respect": 750, "comfort": 850,
+                    "closeness": 850, "resonance": 750, "romance_interest": 850}
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+        self.identity = "qq-adapter:user-1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def _settle(self, event_id, payload):
+        event = FakeEvent()
+        event.message_obj = type("Message", (), {"message_id": event_id})()
+        await self.plugin.judge(event, FakeResponse('<relation_judgment>' + json.dumps(payload) + '</relation_judgment>好的。'))
+
+    async def test_zero_score_friend_creation_is_shown(self):
+        self.plugin.store.set_dimension(self.identity, "global", "", "trust", 600)
+        await self._settle("cf-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "friend",
+                                                              "origin": "user_request", "mutuality": "clear",
+                                                              "summary": "s"}})
+        text = "".join([item async for item in self.plugin.history(FakeEvent(user_id="user-1"))])
+        self.assertIn("正式关系建立：朋友", text)
+
+    async def test_zero_score_partner_creation_is_shown(self):
+        for key, value in {"trust": 650, "respect": 650, "comfort": 550, "resonance": 550}.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        await self._settle("cp-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "partner",
+                                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                                              "summary": "s"}})
+        text = "".join([item async for item in self.plugin.history(FakeEvent(user_id="user-1"))])
+        self.assertIn("正式关系建立：搭档", text)
+
+    def _prime_spouse(self):
+        for key, value in self.SPOUSE_READY.items():
+            self.plugin.store.set_dimension(self.identity, "global", "", key, value)
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="shown", romance_state="eligible")
+        self.plugin.store.apply_turn_with_binding(
+            event_id="evt-p", identity=self.identity, scope_kind="global", scope_id="",
+            source_kind="private", evidence="", reason="", requested={}, applied={}, notes={},
+            binding={"binding_id": "partner-1", "type_key": "romantic_partner", "unique_scope": "romance",
+                     "origin": "test", "summary": ""})
+
+    async def test_upgrade_marker_hidden_in_group(self):
+        self._prime_spouse()
+        await self._settle("hg-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                                              "summary": "s"}})
+        group_event = FakeEvent(group_id="group-1", wake=True, outline="[At:bot-1] hi")
+        group_event.message_obj = type("Message", (), {"message_id": "gh-1"})()
+        group_text = await self.plugin.history(group_event).__anext__()
+        self.assertNotIn("已升级", group_text)
+        self.assertNotIn("恋人", group_text)
+        self.assertNotIn("此生挚爱", group_text)
+
+    async def test_upgrade_marker_hidden_for_hidden_private_policy(self):
+        self._prime_spouse()
+        await self._settle("hh-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                                              "summary": "s"}})
+        # The same user later switches to hidden: history must not surface
+        # the identifiable upgrade even in a private chat.
+        self.plugin.store.set_state(self.identity, "global", "", romance_policy="hidden", romance_state="hidden")
+        text = "".join([item async for item in self.plugin.history(FakeEvent(user_id="user-1"))])
+        self.assertNotIn("已升级", text)
+        self.assertNotIn("此生挚爱", text)
+
+    async def test_upgrade_marker_visible_in_allowed_private(self):
+        self._prime_spouse()
+        await self._settle("hv-1", {"schema_version": 3, "fact_effects": [],
+                                    "relationship_proposal": {"action": "bind", "type_id": "spouse",
+                                                              "origin": "mutual_dialogue", "mutuality": "clear",
+                                                              "summary": "s"}})
+        text = "".join([item async for item in self.plugin.history(FakeEvent(user_id="user-1"))])
+        self.assertIn("正式关系已升级：恋人 → 此生挚爱", text)
+
+
 class BoundaryProtocolTests(unittest.IsolatedAsyncioTestCase):
     """MIS-121: protocol-removal boundaries from the re-review. Component
     order survives whole-block removal regardless of whitespace padding, and

@@ -1250,6 +1250,97 @@ class LegacyConflictBootTests(unittest.TestCase):
 
 
 
+class RestoreLockOwnershipTests(unittest.TestCase):
+    """MIS-134 R01: the restore exclusion is a lock FILE outside the database
+    with owner-token checks at every live-state boundary — an expired or
+    disowned restorer can neither copy, nor roll back, nor delete a
+    successor's lock; activation is refused while any unexpired lock exists."""
+
+    def _store(self, directory: Path) -> RelationStore:
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+        store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+        return store
+
+    def test_expired_lock_taken_over_and_old_owner_aborts(self):
+        # Scenario A (compressed TTL, real expiry): A's lock expires, B takes
+        # over and activates; A must abort before touching live state.
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store_a = self._store(directory)
+            token_a = store_a._acquire_restore_lock(ttl_seconds=1)
+            self.assertIsNotNone(token_a)
+            time.sleep(1.2)  # real expiry
+            # A plain activation (no restore lock) succeeds on the expired
+            # window; the stale owner is disowned: assertion raises, release
+            # is a no-op.
+            store_b = self._store(directory)
+            result = store_b.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
+            self.assertTrue(result["activated"])
+            with self.assertRaises(RuntimeError):
+                store_a._assert_restore_lock(token_a)
+            store_a._release_restore_lock(token_a)
+            self.assertEqual("scope", store_b.active_binding_policy()["exclusivity"])
+
+    def test_activation_refused_while_lock_held_then_succeeds_after(self):
+        # Scenario B: the lock survives the database copy (it lives outside),
+        # so activation cannot slip in between copy and verification.
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store_a = self._store(directory)
+            token_a = store_a._acquire_restore_lock(ttl_seconds=60)
+            other = self._store(directory)
+            refused = other.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
+            self.assertFalse(refused["activated"])
+            self.assertEqual("restore_in_progress", refused["reason"])
+            store_a._release_restore_lock(token_a)
+            accepted = other.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
+            self.assertTrue(accepted["activated"])
+            self.assertEqual("scope", other.active_binding_policy()["exclusivity"])
+
+    def test_release_never_deletes_successor_lock(self):
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            store_a = self._store(Path(directory))
+            token_a = store_a._acquire_restore_lock(ttl_seconds=1)
+            time.sleep(1.1)
+            store_b = self._store(Path(directory))
+            token_b = store_b._acquire_restore_lock(ttl_seconds=60)
+            store_a._release_restore_lock(token_a)  # stale owner: must not delete B's lock
+            self.assertTrue(store_b._restore_lock_owned(token_b))
+
+    def test_disowned_restorer_does_not_roll_back_successor_state(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store = self._store(directory)
+            store.account("qq:keep", "global", "")
+            store.set_dimension("qq:keep", "global", "", "trust", 600)
+            backup = store.backup_now("manual")
+            real_copy = RelationStore._copy_into_live
+
+            def copy_then_lose(store_self, source):
+                # Successor takes over the lock file (expiry window) and
+                # activates BEFORE the copy lands — exactly the race the
+                # reviewer reproduced in scenario B.
+                lock_path = store_self._restore_lock_path()
+                lock_path.write_text(json.dumps(
+                    {"owner": "successor", "until": time.time() + 60}), encoding="utf-8")
+                store_self.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
+                real_copy(store_self, source)
+
+            with mock.patch.object(store, "_copy_into_live", new=lambda s: copy_then_lose(store, s)):
+                with self.assertRaises(RuntimeError):
+                    store.restore_backup(backup.name, kind="manual")
+            # The failure boundary is documented: the copy landed (data
+            # restored), the successor's racing activation was clobbered by
+            # it, no rollback ran (A is disowned), the successor's lock file
+            # was never deleted, and no false success was returned.
+            self.assertEqual(600, store.existing_account("qq:keep", "global", "")["values"]["trust"])
+            self.assertEqual("none", store.active_binding_policy()["exclusivity"])
+            state = store._restore_lock_state()
+            self.assertIsNotNone(state)
+            self.assertEqual("successor", state.get("owner"))
+
+
 class RestoreMigrationTests(unittest.TestCase):
     """MIS-117: restoring an older-schema backup must migrate the live copy to
     the current schema; silently leaving the live database on the old version
