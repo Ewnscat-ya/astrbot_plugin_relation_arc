@@ -1255,6 +1255,36 @@ class LegacyConflictBootTests(unittest.TestCase):
 
 
 
+class StoreBusyDeferredActivationTests(unittest.TestCase):
+    """MIS-134 N01: mutex contention is a temporary, expected condition —
+    activation converts StoreBusy into a deferred refusal (effective policy
+    preserved, retryable error surfaced) instead of letting the exception
+    escape and kill plugin construction."""
+
+    def test_busy_mutex_yields_deferred_refusal(self):
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store_a = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            store_a.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            store_b = RelationStore(directory, {"binding_policy": {"exclusivity": "scope", "rebind_cooldown": "type_default"}})
+            with store_a._restore_exclusive():
+                result = store_b.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
+            # Deferred, not failed: effective policy preserved, retryable.
+            self.assertFalse(result["activated"])
+            self.assertEqual("busy", result["reason"])
+            self.assertEqual("none", result["effective"]["exclusivity"])
+            self.assertIsNotNone(store_b.policy_activation_error)
+            self.assertIn("推迟", store_b.policy_activation_error["message"])
+            # After release the same call retries and succeeds.
+            result = store_b.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
+            self.assertTrue(result["activated"])
+            self.assertIsNone(store_b.policy_activation_error)
+
+    def test_storebusy_is_a_valueerror_for_existing_contract(self):
+        from astrbot_plugin_relation_arc.relation_store import StoreBusy
+        self.assertTrue(issubclass(StoreBusy, ValueError))
+
+
 class RestoreMutexTests(unittest.TestCase):
     """MIS-134 R01 (review round 3): activation and restore hold the SAME
     cross-instance mutex for their whole operation — an OS byte-range lock

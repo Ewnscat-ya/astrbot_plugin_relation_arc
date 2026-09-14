@@ -1418,6 +1418,87 @@ class ConfigSourceWriteGuardTests(unittest.IsolatedAsyncioTestCase):
                          self.plugin.config["binding_policy_source"])
 
 
+class PluginConstructionUnderContentionTests(unittest.TestCase):
+    """MIS-134 N01: a reload while another instance holds the mutex must not
+    kill plugin construction — the plugin registers normally (Pages APIs
+    stay available), the effective policy is preserved and the deferred
+    activation is surfaced via policy_status; a later activation retries and
+    clears the error."""
+
+    def test_construction_succeeds_under_mutex_contention(self):
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            # The holder must own the SAME mutex file the plugin's own store
+            # uses: its data dir, not the plugin_data subdirectory root.
+            plugin_data = directory / "plugin_data" / "astrbot_plugin_relation_arc"
+            holder = RelationStore(plugin_data, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            holder.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            mutex_cm = holder._restore_exclusive()
+            mutex_cm.__enter__()
+            try:
+                context = FakeContext(str(directory))
+                plugin = RelationArc(context)  # must not raise
+                self.assertEqual(8, len(context.apis))  # Pages APIs registered
+                status = plugin.store.policy_status()
+                self.assertEqual("none", status["effective"]["exclusivity"])
+                self.assertIsNotNone(status["activation_error"])
+                self.assertIn("推迟", status["activation_error"]["message"])
+                plugin.store.close()
+            finally:
+                mutex_cm.__exit__(None, None, None)
+            # Retry path: a later activation succeeds and clears the error.
+            fresh = RelationStore(plugin_data, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+            result = fresh.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+            self.assertEqual("unchanged", result["reason"])
+            self.assertIsNone(fresh.policy_activation_error)
+            fresh.close()
+
+
+class StagingCleanupTests(unittest.TestCase):
+    """MIS-134 N02: this restore's private staging is removed on every exit
+    path — success, staging verification failure, post-copy failure — and
+    never leaves .tmp residue behind."""
+
+    def _store(self, directory: Path) -> RelationStore:
+        store = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
+        store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
+        return store
+
+    def _tmp_residue(self, directory: Path) -> int:
+        return len(list((directory / "backups" / "manual").glob("*.tmp")))
+
+    def test_repeated_successful_restores_leave_no_residue(self):
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store = self._store(directory)
+            store.account("qq:a", "global", "")
+            store.set_dimension("qq:a", "global", "", "trust", 555)
+            backup = store.backup_now("manual")
+            for _ in range(3):
+                store.restore_backup(backup.name, kind="manual")
+            self.assertEqual(0, self._tmp_residue(directory))
+
+    def test_failed_restore_leaves_no_residue(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            directory = Path(directory)
+            store = self._store(directory)
+            store.account("qq:a", "global", "")
+            backup = store.backup_now("manual")
+            with mock.patch.object(store, "_verify_staging",
+                                   side_effect=ValueError("staging verification failed")):
+                with self.assertRaises(ValueError):
+                    store.restore_backup(backup.name, kind="manual")
+            self.assertEqual(0, self._tmp_residue(directory))
+            # Post-copy failure path too: rollback raises after the copy, the
+            # staging copy must still be removed.
+            with mock.patch.object(store, "_verify_restored_live",
+                                   side_effect=RuntimeError("clobber detected")):
+                with self.assertRaises(RuntimeError):
+                    store.restore_backup(backup.name, kind="manual")
+            self.assertEqual(0, self._tmp_residue(directory))
+
+
 class HealthClassificationTests(unittest.IsolatedAsyncioTestCase):
     """MIS-134 R02/R03: settlement health follows the WHOLE turn's actual
     result — a pure rejection receipt lands in binding_rejected (never

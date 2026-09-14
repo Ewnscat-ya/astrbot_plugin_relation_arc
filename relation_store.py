@@ -5,6 +5,7 @@ import os
 import hashlib
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -18,6 +19,12 @@ from .relationship_types import get_type
 SCHEMA_VERSION = 12
 BACKUP_KINDS = {"auto", "manual", "migration", "pre_restore"}
 SAFETY_RANK = {"normal": 0, "slow_down": 1, "pause_intimacy": 2}
+
+
+class StoreBusy(ValueError):
+    """MIS-134 N01: the policy/restore mutex is held by another instance.
+    A temporary, expected contention — callers convert it into a deferred
+    activation (effective policy preserved) instead of a load failure."""
 
 
 
@@ -242,51 +249,76 @@ class RelationStore:
     def activate_binding_policy(self, desired: dict[str, Any]) -> dict[str, Any]:
         """MIS-125 R2: activate the desired policy after a reload.
 
-        One BEGIN IMMEDIATE transaction: the cross-user romance index follows
-        the new exclusivity and the epoch advances only on a real change (a
-        restart with unchanged policy never churns the epoch). An activation
-        that would turn exclusivity on while any persisted scope already
-        holds romance bindings from several users is refused: the previous
-        policy stays effective, the desired JSON is kept and the conflict is
-        reported without touching a single relationship row."""
+        The whole read → precheck → write sequence holds the SAME
+        cross-instance mutex as restore (MIS-134 R01), so neither can
+        clobber the other. One BEGIN IMMEDIATE transaction: the cross-user
+        romance index follows the new exclusivity and the epoch advances
+        only on a real change (a restart with unchanged policy never churns
+        the epoch). An activation that would turn exclusivity on while any
+        persisted scope already holds romance bindings from several users is
+        refused: the previous policy stays effective, the desired JSON is
+        kept and the conflict is reported without touching a single
+        relationship row. Temporary mutex contention (N01) is converted into
+        a deferred refusal — the plugin keeps loading with the current
+        effective policy and a later reload retries."""
         if not isinstance(desired, dict):
             desired = {}
         wanted_exclusivity = desired.get("exclusivity")
         wanted_cooldown = desired.get("rebind_cooldown")
-        # MIS-134 R01: activation and restore hold the SAME cross-instance
-        # mutex for their whole operation — the read of the live policy, the
-        # conflict precheck and the write happen inside it, so neither can
-        # observe "no restore" and then be clobbered, and a restore can
-        # never copy over a confirmed activation.
-        with self._restore_exclusive(), self.lock, self._connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            current = self._active_policy_row(conn)
-            self.policy_activation_error = None
-            if wanted_exclusivity == "scope" and current["exclusivity"] != "scope":
-                clash_count = int(conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
-                if clash_count:
-                    self.policy_activation_error = {
-                        "message": f"{clash_count} 个 scope 已有多个用户的恋爱关系；请先按 binding_id 结束多余关系，再重载激活",
-                        "conflict_scopes": clash_count,
-                    }
-                    conn.execute("ROLLBACK")
-                    row = self._active_policy_row(conn)
-                    return {"activated": False, "reason": "legacy_conflict", **self.policy_activation_error,
-                            "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
-                                          "epoch": int(row["epoch"])}}
-            changed = (wanted_exclusivity != current["exclusivity"]) or (wanted_cooldown != current["rebind_cooldown"])
-            epoch = int(current["epoch"])
-            if changed:
-                epoch += 1
-                conn.execute("UPDATE binding_policy SET exclusivity=?,rebind_cooldown=?,epoch=?,updated_at=? WHERE id=1",
-                             (wanted_exclusivity, wanted_cooldown, epoch, time.time()))
-            summary = self._reconcile_binding_constraints(conn)
-            conn.commit()
-        return {"activated": changed, "reason": None if changed else "unchanged",
-                "effective": {"exclusivity": summary["exclusivity"],
-                              "rebind_cooldown": wanted_cooldown if changed else current["rebind_cooldown"],
-                              "epoch": summary["epoch"]},
-                "legacy_conflicts": summary["legacy_conflicts"]}
+        mutex_cm = self._restore_exclusive()
+        try:
+            mutex_cm.__enter__()
+        except StoreBusy:
+            # MIS-134 N01: expected temporary contention (another instance is
+            # restoring/activating). Defer: keep the effective policy, keep
+            # desired/pending, surface a retryable error — the plugin still
+            # loads and a later reload retries the activation.
+            self.policy_activation_error = {"message": "另一实例正在恢复/激活，策略激活已推迟；下次重载自动重试", "conflict_scopes": 0}
+            row = self._active_policy_row_plain()
+            return {"activated": False, "reason": "busy", **self.policy_activation_error,
+                    "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
+                                  "epoch": int(row["epoch"])}}
+        try:
+            with self.lock, self._connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._active_policy_row(conn)
+                self.policy_activation_error = None
+                if wanted_exclusivity == "scope" and current["exclusivity"] != "scope":
+                    clash_count = int(conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
+                    if clash_count:
+                        self.policy_activation_error = {
+                            "message": f"{clash_count} 个 scope 已有多个用户的恋爱关系；请先按 binding_id 结束多余关系，再重载激活",
+                            "conflict_scopes": clash_count,
+                        }
+                        conn.execute("ROLLBACK")
+                        row = self._active_policy_row(conn)
+                        return {"activated": False, "reason": "legacy_conflict", **self.policy_activation_error,
+                                "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
+                                              "epoch": int(row["epoch"])}}
+                changed = (wanted_exclusivity != current["exclusivity"]) or (wanted_cooldown != current["rebind_cooldown"])
+                epoch = int(current["epoch"])
+                if changed:
+                    epoch += 1
+                    conn.execute("UPDATE binding_policy SET exclusivity=?,rebind_cooldown=?,epoch=?,updated_at=? WHERE id=1",
+                                 (wanted_exclusivity, wanted_cooldown, epoch, time.time()))
+                summary = self._reconcile_binding_constraints(conn)
+                conn.commit()
+            return {"activated": changed, "reason": None if changed else "unchanged",
+                    "effective": {"exclusivity": summary["exclusivity"],
+                                  "rebind_cooldown": wanted_cooldown if changed else current["rebind_cooldown"],
+                                  "epoch": summary["epoch"]},
+                    "legacy_conflicts": summary["legacy_conflicts"]}
+        except BaseException:
+            # Re-throw into the context manager so its unlock finally runs,
+            # then let the original error propagate untouched.
+            mutex_cm.__exit__(*sys.exc_info())
+            raise
+        else:
+            mutex_cm.__exit__(None, None, None)
+
+    def _active_policy_row_plain(self) -> sqlite3.Row:
+        with self.lock, self._connection() as conn:
+            return self._active_policy_row(conn)
 
     @staticmethod
     def _active_policy_row(conn) -> sqlite3.Row:
@@ -1279,32 +1311,41 @@ class RelationStore:
         # the final copy and any rollback all happen inside it. While it is
         # held, activation is refused; while an activation runs, a restore
         # is refused. A crashed holder is cleared by the OS on process exit.
-        with self._restore_exclusive():
-            self._materialize_staging(source, staging)
-            self._migrate_staging(staging, from_version=version, backup_name=source.name)
-            live_policy=self.active_binding_policy()
-            summary=self._inject_staging_policy(staging, live_policy)
-            self._verify_staging(staging)
-            pre_restore_path=self.backup_now("pre_restore")
+        try:
+            with self._restore_exclusive():
+                self._materialize_staging(source, staging)
+                self._migrate_staging(staging, from_version=version, backup_name=source.name)
+                live_policy=self.active_binding_policy()
+                summary=self._inject_staging_policy(staging, live_policy)
+                self._verify_staging(staging)
+                pre_restore_path=self.backup_now("pre_restore")
+                try:
+                    self._copy_into_live(staging)
+                    self._verify_restored_live(live_policy)
+                except Exception:
+                    # The live database was replaced but does not match the
+                    # verified staging (or the copy itself failed): roll back
+                    # to THIS restore's own pre-restore snapshot instead of
+                    # faking success. Inside the mutex this can never undo a
+                    # confirmed activation — none can run concurrently.
+                    self._copy_into_live(pre_restore_path)
+                    raise
+                self.policy_activation_error=None
+                return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
+                        "integrity": "ok", "migrated": version < SCHEMA_VERSION,
+                        "policy": {"exclusivity": live_policy["exclusivity"],
+                                   "rebind_cooldown": live_policy["rebind_cooldown"],
+                                   "epoch": int(live_policy["epoch"]) + 1,
+                                   "legacy_conflicts": summary["legacy_conflicts"]}}
+        finally:
+            # MIS-134 N02: this restore's private staging is removed on EVERY
+            # exit path; a cleanup failure is logged without masking the
+            # original restore error and never touches backups or live data.
             try:
-                self._copy_into_live(staging)
-                self._verify_restored_live(live_policy)
-            except Exception:
-                # The live database was replaced but does not match the
-                # verified staging (or the copy itself failed): roll back to
-                # THIS restore's own pre-restore snapshot instead of faking
-                # success. Inside the mutex this can never undo a confirmed
-                # activation — none can run concurrently.
-                self._copy_into_live(pre_restore_path)
-                raise
-            self.policy_activation_error=None
-            return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
-                    "integrity": "ok", "migrated": version < SCHEMA_VERSION,
-                    "policy": {"exclusivity": live_policy["exclusivity"],
-                               "rebind_cooldown": live_policy["rebind_cooldown"],
-                               "epoch": int(live_policy["epoch"]) + 1,
-                               "legacy_conflicts": summary["legacy_conflicts"]}}
-        staging.unlink(missing_ok=True)
+                staging.unlink(missing_ok=True)
+            except OSError:
+                import logging
+                logging.getLogger(__name__).warning("[relation-arc] staging cleanup failed: %s", staging)
 
     def _inject_staging_policy(self, staging: Path, live_policy: dict[str, Any]) -> dict[str, Any]:
         """MIS-134 C01/C03: adopt the CURRENT effective policy with a
@@ -1375,7 +1416,7 @@ class RelationStore:
                         import fcntl
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError as exc:
-                    raise ValueError("policy/restore operation in progress on another instance") from exc
+                    raise StoreBusy("policy/restore operation in progress on another instance") from exc
                 os.lseek(fd, 0, 0)
                 os.truncate(fd, 0)
                 os.write(fd, json.dumps({"pid": os.getpid(), "since": time.time()}).encode("utf-8"))

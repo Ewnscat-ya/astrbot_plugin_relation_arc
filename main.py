@@ -66,6 +66,11 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
             logger.info("[关系弧线] binding_policy activated exclusivity=%s epoch=%s", activation["effective"]["exclusivity"], activation["effective"]["epoch"])
         elif activation.get("reason") == "legacy_conflict":
             logger.warning("[关系弧线] binding_policy activation refused conflicts=%s effective=%s", activation.get("conflict_scopes"), activation["effective"]["exclusivity"])
+        elif activation.get("reason") == "busy":
+            # MIS-134 N01: deferred, not failed — the plugin registers
+            # normally with the current effective policy; the next reload
+            # retries the activation and clears pending/error on success.
+            logger.warning("[关系弧线] binding_policy activation deferred (mutex busy); effective=%s", activation["effective"]["exclusivity"])
         self.plugin_version = PLUGIN_VERSION
         self._decay_task: asyncio.Task | None = None
         self._backup_task: asyncio.Task | None = None
