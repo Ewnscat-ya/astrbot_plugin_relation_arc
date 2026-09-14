@@ -303,18 +303,21 @@ class RelationStore:
                                  (wanted_exclusivity, wanted_cooldown, epoch, time.time()))
                 summary = self._reconcile_binding_constraints(conn)
                 conn.commit()
-            return {"activated": changed, "reason": None if changed else "unchanged",
-                    "effective": {"exclusivity": summary["exclusivity"],
-                                  "rebind_cooldown": wanted_cooldown if changed else current["rebind_cooldown"],
-                                  "epoch": summary["epoch"]},
-                    "legacy_conflicts": summary["legacy_conflicts"]}
+                result = {"activated": changed, "reason": None if changed else "unchanged",
+                          "effective": {"exclusivity": summary["exclusivity"],
+                                        "rebind_cooldown": wanted_cooldown if changed else current["rebind_cooldown"],
+                                        "epoch": summary["epoch"]},
+                          "legacy_conflicts": summary["legacy_conflicts"]}
+            # MIS-134 maintenance (review 056b25a): the mutex exit is explicit
+            # on EVERY path — the success return no longer relies on the
+            # context-manager generator being collected by GC.
+            mutex_cm.__exit__(None, None, None)
+            return result
         except BaseException:
             # Re-throw into the context manager so its unlock finally runs,
             # then let the original error propagate untouched.
             mutex_cm.__exit__(*sys.exc_info())
             raise
-        else:
-            mutex_cm.__exit__(None, None, None)
 
     def _active_policy_row_plain(self) -> sqlite3.Row:
         with self.lock, self._connection() as conn:
