@@ -283,6 +283,7 @@ class RelationStore:
                 conn.execute("BEGIN IMMEDIATE")
                 current = self._active_policy_row(conn)
                 self.policy_activation_error = None
+                deferred_conflict = None
                 if wanted_exclusivity == "scope" and current["exclusivity"] != "scope":
                     clash_count = int(conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
                     if clash_count:
@@ -292,9 +293,14 @@ class RelationStore:
                         }
                         conn.execute("ROLLBACK")
                         row = self._active_policy_row(conn)
-                        return {"activated": False, "reason": "legacy_conflict", **self.policy_activation_error,
-                                "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
-                                              "epoch": int(row["epoch"])}}
+                        deferred_conflict = {"activated": False, "reason": "legacy_conflict", **self.policy_activation_error,
+                                             "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
+                                                           "epoch": int(row["epoch"])}}
+                if deferred_conflict is not None:
+                    # MIS-134 maintenance: this early exit releases the mutex
+                    # explicitly like every other path.
+                    mutex_cm.__exit__(None, None, None)
+                    return deferred_conflict
                 changed = (wanted_exclusivity != current["exclusivity"]) or (wanted_cooldown != current["rebind_cooldown"])
                 epoch = int(current["epoch"])
                 if changed:
