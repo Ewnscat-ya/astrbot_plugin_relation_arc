@@ -1076,21 +1076,21 @@ class ConcurrentRestoreTests(unittest.TestCase):
             thread_a.start(); thread_b.start()
             thread_a.join(30); thread_b.join(30)
             self.assertFalse(thread_a.is_alive() or thread_b.is_alive(), "restore threads deadlocked")
+            # MIS-134 R01 (review round 3): with the shared held-for-duration
+            # mutex the two restores SERIALISE — each completes on its own
+            # private staging with a strictly newer epoch; no empty database,
+            # no fake success, no clobber.
             self.assertIn("a", results)
-            self.assertIn("b_error", results)
-            self.assertIn("another restore is in progress", results["b_error"])
-            # A completes on its own private staging even though B's cleanup
-            # of the OLD shared-name staging happened in between (the staging
-            # names no longer collide, so no empty-database copy is possible).
-            self.assertEqual(SCHEMA_VERSION, results["a"]["schema_version"])
-            self.assertEqual("ok", results["a"]["integrity"])
+            self.assertIn("b", results)
+            for key in ("a", "b"):
+                self.assertEqual(SCHEMA_VERSION, results[key]["schema_version"])
+                self.assertEqual("ok", results[key]["integrity"])
+            self.assertEqual(2, results["a"]["policy"]["epoch"])
+            self.assertEqual(3, results["b"]["policy"]["epoch"])
             shape = self._live_shape(directory)
             self.assertEqual(SCHEMA_VERSION, shape["version"])
             self.assertGreaterEqual(shape["tables"], 8)
             self.assertEqual(1, shape["accounts"])
-            # The refused restore is retryable: once A finished, B succeeds.
-            results["b"] = store_b.restore_backup(backup.name, kind="manual")
-            self.assertEqual(SCHEMA_VERSION, results["b"]["schema_version"])
 
     def test_restore_keeps_concurrent_activation_and_fresh_epoch(self):
         # C03: activation racing a restore is refused while the lease is
@@ -1107,6 +1107,7 @@ class ConcurrentRestoreTests(unittest.TestCase):
             activation_done = threading.Event()
             real_inject = RelationStore._inject_staging_policy
             activation_result = {}
+            other = self._store(directory, exclusivity="none")
 
             def inject_a(self, staging, policy):
                 out = real_inject(self, staging, policy)
@@ -1115,8 +1116,10 @@ class ConcurrentRestoreTests(unittest.TestCase):
                 return out
 
             def run_b():
+                # MIS-134 R01 (review round 3): the activation serialises
+                # behind the restore on the shared mutex — it can only run
+                # after the restore's copy, on the post-restore state.
                 injected_a.wait(10)
-                other = self._store(directory, exclusivity="none")
                 activation_result["value"] = other.activate_binding_policy(
                     {"exclusivity": "scope", "rebind_cooldown": "off"})
                 activation_done.set()
@@ -1127,12 +1130,14 @@ class ConcurrentRestoreTests(unittest.TestCase):
                 result = store_a.restore_backup(backup.name, kind="manual")
                 thread_b.join(30)
             self.assertFalse(thread_b.is_alive())
-            self.assertEqual("restore_in_progress", activation_result["value"]["reason"])
-            # The live policy is the restored one with a fresh, never-reused
-            # epoch; requests pinned to the previous epoch can no longer bind.
+            # Serialized, never interleaved: restore completed on epoch 2,
+            # the activation then took effect with a strictly newer epoch —
+            # one epoch never represented two different policies.
+            self.assertTrue(activation_result["value"]["activated"])
+            self.assertEqual("scope", activation_result["value"]["effective"]["exclusivity"])
+            self.assertEqual("scope", store_a.active_binding_policy()["exclusivity"])
+            self.assertGreater(store_a.active_binding_policy()["epoch"], epoch_before)
             self.assertEqual("none", result["policy"]["exclusivity"])
-            self.assertEqual(epoch_before + 1, result["policy"]["epoch"])
-            self.assertEqual("none", store_a.active_binding_policy()["exclusivity"])
             self.assertEqual("binding_rejected:policy_changed",
                              store_a.apply_turn_with_binding(
                                  event_id="stale-1", identity="qq:stale", scope_kind="global", scope_id="",
@@ -1250,95 +1255,103 @@ class LegacyConflictBootTests(unittest.TestCase):
 
 
 
-class RestoreLockOwnershipTests(unittest.TestCase):
-    """MIS-134 R01: the restore exclusion is a lock FILE outside the database
-    with owner-token checks at every live-state boundary — an expired or
-    disowned restorer can neither copy, nor roll back, nor delete a
-    successor's lock; activation is refused while any unexpired lock exists."""
+class RestoreMutexTests(unittest.TestCase):
+    """MIS-134 R01 (review round 3): activation and restore hold the SAME
+    cross-instance mutex for their whole operation — an OS byte-range lock
+    on a file outside the database plus an in-process reentrant lock. There
+    is no TTL and no takeover, so a stale holder cannot exist. In-process
+    contention serialises (the later operation waits, then runs on the
+    post-restore state); cross-process contention refuses. Either way one
+    epoch never represents two different policies."""
 
     def _store(self, directory: Path) -> RelationStore:
         store = RelationStore(directory, {"binding_policy": {"exclusivity": "none", "rebind_cooldown": "off"}})
         store.activate_binding_policy({"exclusivity": "none", "rebind_cooldown": "off"})
         return store
 
-    def test_expired_lock_taken_over_and_old_owner_aborts(self):
-        # Scenario A (compressed TTL, real expiry): A's lock expires, B takes
-        # over and activates; A must abort before touching live state.
+    def test_activation_serialises_behind_restore_without_interleaving(self):
+        # Scenario A closed: while the restore holds the mutex (paused mid-
+        # staging), an activation cannot run between the policy capture and
+        # the copy — it serialises behind the restore and then activates on
+        # the post-restore state with a strictly newer epoch.
         with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
             directory = Path(directory)
             store_a = self._store(directory)
-            token_a = store_a._acquire_restore_lock(ttl_seconds=1)
-            self.assertIsNotNone(token_a)
-            time.sleep(1.2)  # real expiry
-            # A plain activation (no restore lock) succeeds on the expired
-            # window; the stale owner is disowned: assertion raises, release
-            # is a no-op.
-            store_b = self._store(directory)
-            result = store_b.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
-            self.assertTrue(result["activated"])
-            with self.assertRaises(RuntimeError):
-                store_a._assert_restore_lock(token_a)
-            store_a._release_restore_lock(token_a)
-            self.assertEqual("scope", store_b.active_binding_policy()["exclusivity"])
-
-    def test_activation_refused_while_lock_held_then_succeeds_after(self):
-        # Scenario B: the lock survives the database copy (it lives outside),
-        # so activation cannot slip in between copy and verification.
-        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
-            directory = Path(directory)
-            store_a = self._store(directory)
-            token_a = store_a._acquire_restore_lock(ttl_seconds=60)
             other = self._store(directory)
-            refused = other.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
-            self.assertFalse(refused["activated"])
-            self.assertEqual("restore_in_progress", refused["reason"])
-            store_a._release_restore_lock(token_a)
-            accepted = other.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "type_default"})
-            self.assertTrue(accepted["activated"])
+            store_a.account("qq:a", "global", "")
+            store_a.set_dimension("qq:a", "global", "", "trust", 555)
+            backup = store_a.backup_now("manual")
+            entered = threading.Event()
+            proceed = threading.Event()
+            real_migrate = RelationStore._migrate_staging
+
+            def migrate_pausing(store_self, staging, **kwargs):
+                real_migrate(store_self, staging, **kwargs)
+                entered.set()
+                proceed.wait(30)
+
+            result = {}
+            activation = {}
+
+            def run_restore():
+                with mock.patch.object(store_a, "_migrate_staging",
+                                       new=lambda st, **kw: migrate_pausing(store_a, st, **kw)):
+                    result["restore"] = store_a.restore_backup(backup.name, kind="manual")
+
+            def run_activation():
+                activation["value"] = other.activate_binding_policy(
+                    {"exclusivity": "scope", "rebind_cooldown": "type_default"})
+
+            thread_restore = threading.Thread(target=run_restore)
+            thread_restore.start()
+            self.assertTrue(entered.wait(10), "restore never reached staging")
+            thread_activation = threading.Thread(target=run_activation)
+            thread_activation.start()
+            # While the restore is still paused, the activation must not
+            # complete — mutual exclusion holds across threads.
+            self.assertFalse(activation_thread_done := thread_activation.join(3) is None and thread_activation.is_alive() is False,
+                             "activation finished while the restore still held the mutex")
+            self.assertTrue(thread_activation.is_alive(), "activation should be waiting for the mutex")
+            proceed.set()
+            thread_restore.join(30)
+            thread_activation.join(30)
+            self.assertFalse(thread_restore.is_alive() or thread_activation.is_alive())
+            # Both succeeded — strictly ordered, never interleaved.
+            self.assertEqual("none", result["restore"]["policy"]["exclusivity"])
+            self.assertTrue(activation["value"]["activated"])
             self.assertEqual("scope", other.active_binding_policy()["exclusivity"])
+            self.assertGreater(other.active_binding_policy()["epoch"],
+                               result["restore"]["policy"]["epoch"])
 
-    def test_release_never_deletes_successor_lock(self):
-        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
-            store_a = self._store(Path(directory))
-            token_a = store_a._acquire_restore_lock(ttl_seconds=1)
-            time.sleep(1.1)
-            store_b = self._store(Path(directory))
-            token_b = store_b._acquire_restore_lock(ttl_seconds=60)
-            store_a._release_restore_lock(token_a)  # stale owner: must not delete B's lock
-            self.assertTrue(store_b._restore_lock_owned(token_b))
-
-    def test_disowned_restorer_does_not_roll_back_successor_state(self):
-        from unittest import mock
+    def test_restore_refused_while_mutex_held_elsewhere(self):
+        # Cross-process shape: a second handle cannot take the OS lock while
+        # it is held, so a racing restore is refused outright instead of
+        # copying over the holder's operation.
         with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
             directory = Path(directory)
             store = self._store(directory)
-            store.account("qq:keep", "global", "")
-            store.set_dimension("qq:keep", "global", "", "trust", 600)
+            store.account("qq:a", "global", "")
+            store.set_dimension("qq:a", "global", "", "trust", 555)
             backup = store.backup_now("manual")
-            real_copy = RelationStore._copy_into_live
+            other = self._store(directory)
+            with store._restore_exclusive():
+                with self.assertRaises(ValueError):
+                    other.restore_backup(backup.name, kind="manual")
+            # After release the restore runs to completion.
+            result = other.restore_backup(backup.name, kind="manual")
+            self.assertEqual(SCHEMA_VERSION, result["schema_version"])
+            self.assertEqual(555, other.existing_account("qq:a", "global", "")["values"]["trust"])
 
-            def copy_then_lose(store_self, source):
-                # Successor takes over the lock file (expiry window) and
-                # activates BEFORE the copy lands — exactly the race the
-                # reviewer reproduced in scenario B.
-                lock_path = store_self._restore_lock_path()
-                lock_path.write_text(json.dumps(
-                    {"owner": "successor", "until": time.time() + 60}), encoding="utf-8")
-                store_self.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
-                real_copy(store_self, source)
-
-            with mock.patch.object(store, "_copy_into_live", new=lambda s: copy_then_lose(store, s)):
-                with self.assertRaises(RuntimeError):
-                    store.restore_backup(backup.name, kind="manual")
-            # The failure boundary is documented: the copy landed (data
-            # restored), the successor's racing activation was clobbered by
-            # it, no rollback ran (A is disowned), the successor's lock file
-            # was never deleted, and no false success was returned.
-            self.assertEqual(600, store.existing_account("qq:keep", "global", "")["values"]["trust"])
-            self.assertEqual("none", store.active_binding_policy()["exclusivity"])
-            state = store._restore_lock_state()
-            self.assertIsNotNone(state)
-            self.assertEqual("successor", state.get("owner"))
+    def test_mutex_released_on_process_exit_shape(self):
+        # The OS byte-range lock is released when the holding handle closes —
+        # including a crashed process. No TTL, no takeover logic involved.
+        with tempfile.TemporaryDirectory(dir=r"D:\第三方插件完善\.tmp_test") as directory:
+            store = self._store(Path(directory))
+            with store._restore_exclusive():
+                pass
+            with store._restore_exclusive():
+                pass
+            self.assertTrue(True)
 
 
 class RestoreMigrationTests(unittest.TestCase):

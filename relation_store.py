@@ -253,21 +253,15 @@ class RelationStore:
             desired = {}
         wanted_exclusivity = desired.get("exclusivity")
         wanted_cooldown = desired.get("rebind_cooldown")
-        with self.lock, self._connection() as conn:
+        # MIS-134 R01: activation and restore hold the SAME cross-instance
+        # mutex for their whole operation — the read of the live policy, the
+        # conflict precheck and the write happen inside it, so neither can
+        # observe "no restore" and then be clobbered, and a restore can
+        # never copy over a confirmed activation.
+        with self._restore_exclusive(), self.lock, self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = self._active_policy_row(conn)
             self.policy_activation_error = None
-            # MIS-134 C03: a running restore holds the lease and will inject
-            # the CURRENT policy; an activation racing it could be clobbered
-            # by the final copy. Refuse while the lease is valid (desired is
-            # kept; ordinary chat is unaffected).
-            if self._restore_lock_held():
-                self.policy_activation_error = {"message": "恢复正在进行中，请稍后重载激活", "conflict_scopes": 0}
-                conn.execute("ROLLBACK")
-                row = self._active_policy_row(conn)
-                return {"activated": False, "reason": "restore_in_progress", **self.policy_activation_error,
-                        "effective": {"exclusivity": row["exclusivity"], "rebind_cooldown": row["rebind_cooldown"],
-                                      "epoch": int(row["epoch"])}}
             if wanted_exclusivity == "scope" and current["exclusivity"] != "scope":
                 clash_count = int(conn.execute("SELECT COUNT(*) FROM (SELECT scope_kind,scope_id FROM relationship_bindings WHERE status='active' AND type_key IN ('romantic_partner','spouse') GROUP BY scope_kind,scope_id HAVING COUNT(DISTINCT identity)>1)").fetchone()[0])
                 if clash_count:
@@ -1280,44 +1274,28 @@ class RelationStore:
             raise ValueError(f"unsupported backup schema version {version}; this build supports 1..{SCHEMA_VERSION}")
         import uuid
         staging=source.with_name(source.stem + f".restoring-{uuid.uuid4().hex[:12]}.tmp")
-        token=self._acquire_restore_lock(ttl_seconds=60)
-        if token is None:
-            raise ValueError("another restore is in progress; retry after it finishes")
-        try:
+        # MIS-134 R01: the SAME shared mutex as activation, held for the
+        # whole restore — policy capture, conflict precheck, verification,
+        # the final copy and any rollback all happen inside it. While it is
+        # held, activation is refused; while an activation runs, a restore
+        # is refused. A crashed holder is cleared by the OS on process exit.
+        with self._restore_exclusive():
             self._materialize_staging(source, staging)
-            # MIS-134 R01: the mutual exclusion lives in a lock FILE outside
-            # the database, so the final copy can never wipe it. Ownership is
-            # re-verified (and the TTL heartbeated) before every phase that
-            # touches live state: an expired or disowned restorer stops
-            # before copying, before rolling back, and can never delete a
-            # successor's lock.
-            self._assert_restore_lock(token)
             self._migrate_staging(staging, from_version=version, backup_name=source.name)
-            # While the lock is held, activation is refused, so this snapshot
-            # of the live policy is authoritative for the whole final phase.
             live_policy=self.active_binding_policy()
             summary=self._inject_staging_policy(staging, live_policy)
             self._verify_staging(staging)
-            self._assert_restore_lock(token)
             pre_restore_path=self.backup_now("pre_restore")
             try:
-                self._assert_restore_lock(token)
                 self._copy_into_live(staging)
                 self._verify_restored_live(live_policy)
-                # MIS-134 R01: ownership re-checked AFTER the copy too — a
-                # restorer that lost the lock mid-copy (TTL expiry + takeover)
-                # must not report success over a successor's head. The state
-                # is left as copied and the error documents the boundary; the
-                # successor's desired JSON survives for the next reload.
-                self._assert_restore_lock(token)
             except Exception:
-                # Defense in depth: if the live database was replaced but
-                # does not match the verified staging, roll back to THIS
-                # restore's own pre-restore snapshot — but only while still
-                # the lock owner; a successor that legitimately took over
-                # (activation included) is never rolled back.
-                if self._restore_lock_owned(token):
-                    self._copy_into_live(pre_restore_path)
+                # The live database was replaced but does not match the
+                # verified staging (or the copy itself failed): roll back to
+                # THIS restore's own pre-restore snapshot instead of faking
+                # success. Inside the mutex this can never undo a confirmed
+                # activation — none can run concurrently.
+                self._copy_into_live(pre_restore_path)
                 raise
             self.policy_activation_error=None
             return {"schema_version": SCHEMA_VERSION, "restored_from_version": version,
@@ -1326,9 +1304,7 @@ class RelationStore:
                                "rebind_cooldown": live_policy["rebind_cooldown"],
                                "epoch": int(live_policy["epoch"]) + 1,
                                "legacy_conflicts": summary["legacy_conflicts"]}}
-        finally:
-            self._release_restore_lock(token)
-            staging.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
 
     def _inject_staging_policy(self, staging: Path, live_policy: dict[str, Any]) -> dict[str, Any]:
         """MIS-134 C01/C03: adopt the CURRENT effective policy with a
@@ -1357,83 +1333,65 @@ class RelationStore:
         return summary
 
     def _restore_lock_path(self) -> Path:
-        """MIS-134 R01: the restore mutual exclusion lives in a lock FILE
-        next to the database — never inside it, so replacing the database
-        cannot delete the exclusion, and a backup cannot carry it."""
+        """MIS-134 R01: the policy/restore mutual exclusion lives in a lock
+        FILE next to the database — never inside it, so replacing the
+        database cannot delete the exclusion, and a backup cannot carry it."""
         return self.data_dir / "relation_arc.restore.lock"
 
-    _RESTORE_LOCK_GUARDS: dict = {}
-    _RESTORE_LOCK_GUARDS_GUARD: threading.Lock = threading.Lock()
+    _RESTORE_MUTEX_GUARDS: dict = {}
+    _RESTORE_MUTEX_GUARDS_GUARD: threading.Lock = threading.Lock()
 
-    def _restore_lock_guard(self) -> threading.Lock:
+    def _restore_mutex_guard(self) -> threading.RLock:
+        # Reentrant: same-thread nesting (e.g. restore -> policy reads that
+        # also take the guard) must not self-deadlock; cross-thread mutual
+        # exclusion is unaffected.
         path=str(self._restore_lock_path())
-        with RelationStore._RESTORE_LOCK_GUARDS_GUARD:
-            return RelationStore._RESTORE_LOCK_GUARDS.setdefault(path, threading.Lock())
+        with RelationStore._RESTORE_MUTEX_GUARDS_GUARD:
+            return RelationStore._RESTORE_MUTEX_GUARDS.setdefault(path, threading.RLock())
 
-    def _acquire_restore_lock(self, ttl_seconds: int) -> str | None:
-        """Take the restore lock (in-process mutex + O_EXCL file). Returns
-        the owner token, or None while another unexpired holder owns it."""
-        token=uuid.uuid4().hex[:12]
+    @contextmanager
+    def _restore_exclusive(self):
+        """MIS-134 R01: the ONE cross-instance mutex shared by policy
+        activation and restore, held for the WHOLE operation.
+
+        In-process: a per-path threading lock serialises threads. Cross-
+        process: an advisory OS byte-range lock on the lock file — the OS
+        releases it when the holding process exits, so a crashed restore or
+        activation never blocks anyone. No TTL, no takeover, no owner
+        checks: a stale holder cannot exist, therefore it can never copy,
+        roll back or clobber a confirmed activation. Non-blocking: a second
+        operation receives 'held by another operation' instead of queueing."""
         lock_path=self._restore_lock_path()
-        guard=self._restore_lock_guard()
-        with self.lock, guard:
-            now=time.time()
+        guard=self._restore_mutex_guard()
+        with guard:
+            fd=os.open(lock_path, os.O_CREAT | os.O_RDWR)
             try:
-                payload=json.loads(lock_path.read_text(encoding="utf-8"))
-                if float(payload.get("until", 0)) > now:
-                    return None
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            except (ValueError, OSError):
-                lock_path.unlink(missing_ok=True)
-            fd=os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, json.dumps({"owner": token, "until": now + max(1, ttl_seconds)}).encode("utf-8"))
-            finally:
-                os.close(fd)
-        return token
-
-    def _restore_lock_state(self) -> dict[str, Any] | None:
-        try:
-            return json.loads(self._restore_lock_path().read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError, OSError):
-            return None
-
-    def _restore_lock_owned(self, token: str) -> bool:
-        state=self._restore_lock_state()
-        # An expired lock is LOST even when no successor has taken over yet:
-        # the stale holder must re-verify against the world, not revive it.
-        return bool(state) and state.get("owner") == token and float(state.get("until", 0)) > time.time()
-
-    def _assert_restore_lock(self, token: str) -> None:
-        """Heartbeat + ownership check: a lost or expired lock aborts the
-        restore before it touches live state again."""
-        if not self._restore_lock_owned(token):
-            raise RuntimeError("restore lock lost; aborting without touching the live database")
-        lock_path=self._restore_lock_path()
-        guard=self._restore_lock_guard()
-        with self.lock, guard:
-            state=self._restore_lock_state()
-            if state and state.get("owner") == token:
-                fd=os.open(lock_path, os.O_TRUNC | os.O_WRONLY)
                 try:
-                    os.write(fd, json.dumps({"owner": token, "until": time.time() + 60}).encode("utf-8"))
-                finally:
-                    os.close(fd)
-
-    def _release_restore_lock(self, token: str) -> None:
-        """Release only when still the owner — never a successor's lock."""
-        lock_path=self._restore_lock_path()
-        guard=self._restore_lock_guard()
-        with self.lock, guard:
-            state=self._restore_lock_state()
-            if state and state.get("owner") == token:
-                lock_path.unlink(missing_ok=True)
-
-    def _restore_lock_held(self) -> bool:
-        state=self._restore_lock_state()
-        return bool(state) and float(state.get("until", 0)) > time.time()
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(fd, 0, 0)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise ValueError("policy/restore operation in progress on another instance") from exc
+                os.lseek(fd, 0, 0)
+                os.truncate(fd, 0)
+                os.write(fd, json.dumps({"pid": os.getpid(), "since": time.time()}).encode("utf-8"))
+                yield
+            finally:
+                try:
+                    os.lseek(fd, 0, 0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
 
     def _verify_restored_live(self, live_policy: dict[str, Any]) -> None:
         """MIS-134 C01/C03: the live database must match the verified staging

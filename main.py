@@ -528,7 +528,9 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # recorded; neither is silently dropped. info["applied"] already
         # carries the actual deltas (paused turns report {}).
         actual_applied = info.get("applied", {}) or {}
-        actual_action = bool(actual_applied) or info.get("timed_safety") is not None             or binding_status in ("binding_created", "binding_upgraded")
+        # R02: a non-empty dict may still be all zeros (e.g. a delta fully
+        # consumed by the rolling window) — only non-zero values are real.
+        actual_action = any(actual_applied.values()) or info.get("timed_safety") is not None             or binding_status in ("binding_created", "binding_upgraded")
         if str(binding_status).startswith("binding_rejected") and not actual_action:
             settlement_outcome = "binding_rejected"
         elif not actual_action:
