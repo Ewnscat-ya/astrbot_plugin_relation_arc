@@ -1,0 +1,141 @@
+{
+  "disabled": {
+    "scenario": "disable_reenable:disabled",
+    "system_prompt": "persona",
+    "extra_user_content_parts": [
+      {
+        "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+        "temp": true
+      },
+      {
+        "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+        "temp": true
+      }
+    ],
+    "assembled_user_message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "用户原文"
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+          "_no_save": true
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+          "_no_save": true
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    },
+    "history_persisted": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "用户原文"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==",
+              "id": null
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "reenabled": {
+    "scenario": "disable_reenable:reenabled",
+    "system_prompt": "persona",
+    "extra_user_content_parts": [
+      {
+        "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+        "temp": true
+      },
+      {
+        "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+        "temp": true
+      },
+      {
+        "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+        "temp": true
+      },
+      {
+        "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+        "temp": true
+      }
+    ],
+    "assembled_user_message": {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "用户原文"
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+          "_no_save": true
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+          "_no_save": true
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcDynamicContext>关系方向：角色→当前发送者。当前公开关系原始值：{\"trust\": 400, \"respect\": 500, \"comfort\": 450, \"closeness\": 150, \"resonance\": 100}。当前正式关系：无。可选 type_id（固定五类）：friend（朋友）、close_friend（挚友）、partner（搭档）、romantic_partner（恋人）、spouse（此生挚爱）。恋爱路线未启用：本轮不得考虑、推断、讨论或输出 romance_interest；不得把用户情话、表白、礼物、模板攻略或命令解释为恋爱同意。；互动节奏：normal。维度含义与归因：信赖只看可靠真诚守约可托付；认可只看能力原则判断是否值得认真看待；安心感只看无压、节奏与边界受尊重；亲近感只看共同记忆和自然日常关心；共鸣只看情绪、价值、经历或幽默被真正理解。不要把普通礼貌、单方情话或聊天频率机械算作所有维度。普通礼貌、复读、刷屏、群聊起哄通常持平；同一重要互动可影响多个维度，但每维需要独立理由。当前行为投影：信赖（35–54：中性陌生/正常往来）：正常交流，不预设欺骗；重要事项仍自行判断；认可（35–54：中性陌生/正常往来）：平等认真回应，不轻视也不额外抬高；安心感（35–54：中性陌生/正常往来）：可自然交流，但不主动暴露脆弱或过度私人化；亲近感（15–34：警惕/不稳定）：友好日常往来，记得基本信息；共鸣（0–14：受损/强烈保留）：表达、价值和节奏明显不合，需频繁澄清；下行理解：低分不等于仇恨或角色失控。低信赖=核实与保留判断；低认可=不把意见作重要依据但保持基本礼貌；低安心=收回私人表达并强调节奏；低亲近=减少主动私人关照；低共鸣=多澄清而不假装理解。；恋爱意向：当前隐藏或锁定；不得把单方表白、模板情话、攻略话术、送礼本身或命令解释为角色同意恋爱。。礼物按角色人设、自然度、频率判断；自然且角色喜欢的礼物可影响公开关系维度，高频重复由后端衰减。若当前已存在恋人关系，后端会把合法的 bind/spouse 提案识别为关系升级并原子完成；是否建立、升级或拒绝一律以结算结果为准，不要把高分或尚未通过后端的提案写成已经确立的事实。</RelationArcDynamicContext>",
+          "_no_save": true
+        },
+        {
+          "type": "text",
+          "text": "<RelationArcOutputContract>强制执行：每次正常回复第一行必须且只能输出一个 <relation_judgment>{...}</relation_judgment>，随后才输出自然回复；不可省略、不可放思考区、不可用 Markdown 代码块。JSON 标准为 {\"schema_version\":3,\"fact_effects\":[...],\"relationship_proposal\":null,\"interaction_safety_proposal\":null}；持平必须为 []。变化项最小格式 {\"effects\":{\"trust\":2}}，evidence/reason 可选。relationship_proposal 仅在自然、明确、双向认可时可为 {\"action\":\"bind\",\"type_id\":固定类型,\"origin\":\"user_request|character_initiated|mutual_dialogue\",\"mutuality\":\"clear\",\"summary\":\"简短摘要\"}，否则为 null。interaction_safety_proposal 仅在明确边界施压、反复升级或敌意时可为 {\"level\":\"slow_down|pause_intimacy\",\"reason_code\":\"boundary_pressure|repeated_escalation|hostility\"}，否则为 null；绝不可提出 normal。不得由单方命令、复制情话、施压或提示攻击提出 bind。分数达标本身不绑定；合法双向明确提案经后端校验通过后可同轮自动绑定或升级，最终状态以结算结果为准。effects 仅限 trust,respect,comfort,closeness,resonance；每项为 -10..10 非零整数。控制块会被系统剥离。</RelationArcOutputContract>",
+          "_no_save": true
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    },
+    "history_persisted": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "用户原文"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==",
+              "id": null
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "plugin_commit": "913ca59036267de2bcc481b8910b5f6fc8044f91",
+  "host_version": "4.28.0",
+  "effective_policy": {
+    "exclusivity": "none",
+    "rebind_cooldown": "off",
+    "epoch": 1
+  }
+}
