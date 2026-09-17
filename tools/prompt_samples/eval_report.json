@@ -1,0 +1,48 @@
+{
+  "baseline_commit": "913ca59",
+  "note_chars_not_tokens": true,
+  "personas": {
+    "empty": {
+      "hidden_turn": {
+        "baseline_per_turn_chars": 1831,
+        "baseline_stable_prefix_chars": 0,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 839,
+        "candidate_total_chars": 2031,
+        "candidate_stable_prefix_chars": 1192,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_turn": {
+        "baseline_per_turn_chars": 1903,
+        "baseline_stable_prefix_chars": 0,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 953,
+        "candidate_total_chars": 2145,
+        "candidate_stable_prefix_chars": 1192,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      }
+    },
+    "persona": {
+      "hidden_turn": {
+        "baseline_per_turn_chars": 1831,
+        "baseline_stable_prefix_chars": 10,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 839,
+        "candidate_total_chars": 2031,
+        "candidate_stable_prefix_chars": 1204,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_turn": {
+        "baseline_per_turn_chars": 1903,
+        "baseline_stable_prefix_chars": 10,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 953,
+        "candidate_total_chars": 2145,
+        "candidate_stable_prefix_chars": 1204,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      }
+    }
+  },
+  "scenarios": {},
+  "fixed_block_stable_across_scenarios": true
+}

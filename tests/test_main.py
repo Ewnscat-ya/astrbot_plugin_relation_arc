@@ -79,16 +79,22 @@ class RelationArcMainTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.terminate()
         self.temp.cleanup()
 
-    async def test_injection_uses_favour_style_dynamic_then_contract(self):
+    async def test_injection_layout_fixed_system_dynamic_temp(self):
+        # MIS-158: persona stays first and intact; the fixed rules block is
+        # appended after it in the system prompt; the dynamic context and the
+        # short reminder are per-turn temporary parts.
         event = FakeEvent()
         req = ProviderRequest(prompt="hello", system_prompt="persona")
         await self.plugin.inject(event, req)
+        self.assertTrue(req.system_prompt.startswith("persona"))
+        self.assertIn("<RelationArcRules>", req.system_prompt)
+        self.assertIn("</RelationArcRules>", req.system_prompt)
+        self.assertIn("第一行", req.system_prompt)
         parts = req.extra_user_content_parts
         self.assertEqual(2, len(parts))
-        self.assertIn("RelationArcDynamicContext", parts[0].text)
-        self.assertIn("RelationArcOutputContract", parts[1].text)
+        self.assertIn("<RelationArcDynamicContext>", parts[0].text)
+        self.assertIn("<RelationArcTurnNote>", parts[1].text)
         self.assertIn("第一行", parts[1].text)
-        self.assertEqual("persona", req.system_prompt)
 
     async def test_response_is_stripped_and_applied(self):
         event = FakeEvent()
@@ -881,11 +887,11 @@ class MultiFactRepeatDecayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PromptSnapshotTests(unittest.IsolatedAsyncioTestCase):
-    """MIS-127 R4: the real inject chain ships the slimmed prompt - five
-    candidate types always listed (no per-turn threshold matrix), the upgrade
-    recognition note, and the cross-user occupancy only as a boolean while
-    the active policy keeps it on. Exactly two text parts are appended and no
-    model/thinking parameters are touched."""
+    """MIS-158 layout: the fixed rules block lives in the system prompt
+    (persona first, byte-stable for the same persona); the dynamic context
+    and a short reminder are per-turn temporary parts. Five candidate types
+    always listed (no threshold matrix), upgrade recognition present,
+    occupancy only as a boolean while the ACTIVE policy keeps it on."""
 
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -896,38 +902,114 @@ class PromptSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.terminate()
         self.temp.cleanup()
 
-    async def _inject(self):
+    async def _inject(self, system_prompt="persona"):
         event = FakeEvent()
-        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        req = ProviderRequest(prompt="hello", system_prompt=system_prompt)
         await self.plugin.inject(event, req)
-        self.assertEqual("persona", req.system_prompt)  # thinking params untouched
-        return req.extra_user_content_parts
+        return req
 
     async def test_slim_prompt_contract(self):
-        parts = await self._inject()
+        req = await self._inject()
+        parts = req.extra_user_content_parts
         self.assertEqual(2, len(parts))
-        joined = parts[0].text + parts[1].text
+        fixed = req.system_prompt
+        joined = fixed + parts[0].text + parts[1].text
         for key in ("friend", "close_friend", "partner", "romantic_partner", "spouse"):
             self.assertIn(key, joined)  # candidates are never pruned
         self.assertNotIn("≥", joined)  # no numeric gate matrix injected
         self.assertIn("升级", joined)
         self.assertIn("以结算结果为准", joined)
         self.assertNotIn("占用", joined)  # exclusivity off: no occupancy line
-        # Record the slim sizes for the delivery evidence.
-        print(f"PROMPT_SNAPSHOT dynamic={len(parts[0].text)} contract={len(parts[1].text)} total={len(joined)}")
+        # The fixed block delegates the effects whitelist to the turn block.
+        self.assertIn("本轮动态块白名单", fixed)
+        self.assertIn("本轮允许 effects 白名单", parts[0].text)
+        # Record the split sizes for the delivery evidence (chars, not tokens).
+        print(f"PROMPT_SNAPSHOT fixed={len(fixed)} dynamic={len(parts[0].text)} reminder={len(parts[1].text)}")
+
+    async def test_fixed_block_stable_for_same_persona(self):
+        import hashlib
+        req1 = await self._inject("persona-A")
+        req2 = await self._inject("persona-A")
+        self.assertEqual(
+            hashlib.sha256(req1.system_prompt.encode("utf-8")).hexdigest(),
+            hashlib.sha256(req2.system_prompt.encode("utf-8")).hexdigest())
+        # Different persona -> different prefix, same fixed tail.
+        req3 = await self._inject("persona-B")
+        self.assertNotEqual(req1.system_prompt, req3.system_prompt)
+        self.assertTrue(req1.system_prompt.endswith(req3.system_prompt[len("persona-B"):]))
 
     async def test_exclusivity_on_shows_boolean_occupancy_only(self):
         self.plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
-        parts = await self._inject()
-        joined = parts[0].text + parts[1].text
+        req = await self._inject()
+        joined = req.system_prompt + req.extra_user_content_parts[0].text + req.extra_user_content_parts[1].text
         self.assertIn("同 scope 恋爱位置已被他人占用：false", joined)
         self.assertNotIn("qq-", joined)  # no other identity leaks
 
     async def test_effective_policy_drives_the_injection(self):
         # A saved-but-not-activated desired value must NOT change the prompt.
         self.plugin.config["binding_policy"]["exclusivity"] = "scope"
-        parts = await self._inject()
-        self.assertNotIn("占用", parts[0].text + parts[1].text)
+        req = await self._inject()
+        joined = req.extra_user_content_parts[0].text
+        self.assertNotIn("占用", joined)
+
+
+class InjectLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-158/MIS-159: injection is idempotent and owns only its marked
+    segments — repeated inject never stacks, a disabled gate removes the
+    previous turn's segments, and user text / other plugins' parts survive."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.context = FakeContext(self.temp.name)
+        self.plugin = RelationArc(self.context)
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_repeated_inject_does_not_stack(self):
+        event = FakeEvent()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        system_once = req.system_prompt
+        parts_once = len(req.extra_user_content_parts)
+        # The account value changes between the two injects: the dynamic
+        # block must refresh, not duplicate.
+        self.plugin.store.set_dimension("qq-adapter:user-1", "global", "", "trust", 432)
+        await self.plugin.inject(event, req)
+        self.assertEqual(system_once, req.system_prompt)  # fixed block replaced in place
+        self.assertEqual(parts_once, len(req.extra_user_content_parts))
+        self.assertEqual(1, sum(1 for part in req.extra_user_content_parts
+                                if part.text.startswith("<RelationArcDynamicContext>")))
+        self.assertIn("432", req.extra_user_content_parts[0].text)  # refreshed
+
+    async def test_disabled_gate_cleans_previous_injection(self):
+        event = FakeEvent()
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(event, req)
+        self.assertIn("<RelationArcRules>", req.system_prompt)
+        self.assertEqual(2, len(req.extra_user_content_parts))
+        # Disable: the next inject call strips our previous segments.
+        self.plugin.config["llm_judgment_enabled"] = False
+        await self.plugin.inject(event, req)
+        self.assertEqual("persona", req.system_prompt)
+        self.assertEqual([], req.extra_user_content_parts)
+
+    async def test_only_own_marked_segments_are_managed(self):
+        from astrbot.core.agent.message import TextPart
+        event = FakeEvent()
+        other_plugin_part = TextPart(text="<OtherPlugin>keep me</OtherPlugin>")
+        user_like = TextPart(text="some user text mentioning <relation_judgment> as an example")
+        req = ProviderRequest(prompt="hello", system_prompt="persona" + chr(10) + "<OtherPlugin>keep</OtherPlugin>")
+        req.extra_user_content_parts.append(other_plugin_part)
+        req.extra_user_content_parts.append(user_like)
+        await self.plugin.inject(event, req)
+        await self.plugin.inject(event, req)  # second pass must not eat them
+        self.assertIn("<OtherPlugin>keep</OtherPlugin>", req.system_prompt)
+        texts = [part.text for part in req.extra_user_content_parts]
+        self.assertIn("<OtherPlugin>keep me</OtherPlugin>", texts)
+        self.assertTrue(any("some user text" in text for text in texts))
+        self.assertEqual(4, len(req.extra_user_content_parts))  # other + user + dynamic + reminder
 
 
 class UpgradeCooldownTests(unittest.IsolatedAsyncioTestCase):

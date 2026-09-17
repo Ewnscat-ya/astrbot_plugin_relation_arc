@@ -307,6 +307,36 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                 lines.append(f"当前有效：{safety_labels.get(timed['level'], timed['level'])}（自动，剩余约 {minutes} 分钟）")
         return "\n".join(lines)
 
+    # MIS-158: markers delimiting this plugin's owned prompt segments. Only
+    # text between these exact markers is ever managed (added/replaced/
+    # removed); user text, similar examples and other plugins are untouched.
+    _FIXED_MARK = "<RelationArcRules>"
+    _DYNAMIC_MARK = "<RelationArcDynamicContext>"
+    _REMINDER_MARK = "<RelationArcTurnNote>"
+
+    @classmethod
+    def _strip_own_system_block(cls, system_prompt: str) -> str:
+        """Remove this plugin's fixed rules block from a system prompt,
+        leaving the persona (and anything else) byte-identical."""
+        if not system_prompt or cls._FIXED_MARK not in system_prompt:
+            return system_prompt
+        start = system_prompt.index(cls._FIXED_MARK)
+        end_marker = "</RelationArcRules>"
+        end = system_prompt.find(end_marker, start)
+        end = (end + len(end_marker)) if end != -1 else len(system_prompt)
+        stripped = system_prompt[:start] + system_prompt[end:]
+        # Drop the separator this plugin added before the block.
+        return stripped[:-2].rstrip("\n") if stripped.endswith("\n\n") else stripped
+
+    @classmethod
+    def _remove_own_parts(cls, req: ProviderRequest) -> None:
+        """Drop this plugin's previous temporary parts (dynamic block and
+        per-turn reminder) from the request; other parts are untouched."""
+        req.extra_user_content_parts = [
+            part for part in (req.extra_user_content_parts or [])
+            if not (isinstance(part, TextPart) and isinstance(getattr(part, "text", None), str)
+                    and (part.text.startswith(cls._DYNAMIC_MARK) or part.text.startswith(cls._REMINDER_MARK)))]
+
     @filter.on_llm_request()
     async def inject(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         scope_kind, scope_id = self._scope(event); identity=self._identity(event)
@@ -315,6 +345,12 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # Pin the turn before any gate so the response settles in the request's
         # own context even if Pages config changes mid-turn.
         self._pin_turn_context(event)
+        # MIS-158 lifecycle: injection is idempotent — previous own segments
+        # (fixed system block, dynamic part, reminder part) are removed first,
+        # so repeated inject never stacks; a disabled gate leaves the request
+        # clean of our previous turn's segments.
+        req.system_prompt = self._strip_own_system_block(req.system_prompt or "")
+        self._remove_own_parts(req)
         if not self._enabled(event) or not self.config.get("llm_judgment_enabled", True): return
         account = self.store.account(identity, scope_kind, scope_id)
         values, state = account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"])
@@ -331,15 +367,19 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         exclusivity_on = effective_policy["exclusivity"] == "scope"
         exclusive_occupied = exclusivity_on and self.store.exclusive_occupied(scope_kind, scope_id, "romance", self._identity(event))
         binding_ctx = relation_prompts.binding_context(binding_labels, exclusivity_on, exclusive_occupied)
-        types_line = relation_prompts.types_directory_line()
         romance_ctx = relation_prompts.romance_context(visible, eligible, values.get("romance_interest", 0))
         dynamic_prompt = relation_prompts.dynamic_prompt(
-            json.dumps(public_values, ensure_ascii=False), binding_ctx, types_line, romance_ctx,
+            json.dumps(public_values, ensure_ascii=False), binding_ctx, romance_ctx,
             state.get("interaction_safety", "normal"), values, visible, eligible)
-        effect_keys = "trust,respect,comfort,closeness,resonance,romance_interest" if visible else "trust,respect,comfort,closeness,resonance"
-        static_contract = relation_prompts.output_contract(effect_keys)
+        reminder = relation_prompts.short_turn_reminder(visible)
+        # MIS-158 layout: persona first, then this plugin's fixed rules block
+        # appended to the system prompt (stable across turns for the same
+        # persona); the per-turn dynamic context and the short format
+        # reminder stay temporary parts of the current user message.
+        fixed_block = relation_prompts.fixed_rules_block()
+        req.system_prompt = (req.system_prompt + "\n\n" + fixed_block) if req.system_prompt else fixed_block
         req.extra_user_content_parts.append(TextPart(text=dynamic_prompt).mark_as_temp())
-        req.extra_user_content_parts.append(TextPart(text=static_contract).mark_as_temp())
+        req.extra_user_content_parts.append(TextPart(text=reminder).mark_as_temp())
 
     def _read_and_strip_judgment(self, response: LLMResponse, user_text: str):
         """Read the final provider payload without assuming completion_text is used.

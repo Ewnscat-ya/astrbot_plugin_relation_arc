@@ -271,5 +271,28 @@ class HostCommandRegistrationTests(unittest.TestCase):
         self.assertNotIn("inject", dispatchable)
 
 
+@unittest.skipUnless(HAS_HOST, "astrbot host package not installed (missing dependency, not a failure)")
+class HostTempPartContractTests(unittest.TestCase):
+    """MIS-158: verify against the REAL host assembly/history code (not just
+    our mark_as_temp call) that plugin temporary parts reach the provider in
+    the current user message and are filtered out of persisted history."""
+
+    def test_temp_parts_reach_provider_and_stay_out_of_history(self):
+        from astrbot.core.agent.message import Message, TextPart
+        from astrbot.core.agent import message as message_mod
+
+        part = TextPart(text="<RelationArcDynamicContext>x</RelationArcDynamicContext>").mark_as_temp()
+        req_system = "persona" + chr(10) + chr(10) + "<RelationArcRules>fixed</RelationArcRules>"
+        message = Message.model_validate({"role": "user", "content": [TextPart(text="hello"), part]})
+        # History dump (the function internal.py uses before persisting).
+        dumped = message_mod.dump_messages_with_checkpoints([message])
+        persisted_texts = [b.get("text") for b in dumped[0]["content"]]
+        self.assertIn("hello", persisted_texts)
+        self.assertNotIn("<RelationArcDynamicContext>", "".join(str(x) for x in persisted_texts))
+        # The temp flag itself is provider-facing only.
+        self.assertTrue(part._no_save)
+        self.assertIn("_no_save", part.model_dump_for_context())
+
+
 if __name__ == "__main__":
     unittest.main()
