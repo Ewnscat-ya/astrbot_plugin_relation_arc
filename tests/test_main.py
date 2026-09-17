@@ -953,6 +953,72 @@ class PromptSnapshotTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("占用", joined)
 
 
+class PromptOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    """U01 (review 211f9f7): ownership is by per-request record, never by
+    literal tag text. Ported from the reviewer's probe_ownership five
+    counterexamples (plus the untouched-when-disabled acceptance case)."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.plugin = RelationArc(FakeContext(self.temp.name))
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self.temp.cleanup()
+
+    async def test_first_injection_preserves_literal_rules_example(self):
+        persona = "原有人设。示例：<RelationArcRules>这是需要原样引用的示例</RelationArcRules>。后续人设。"
+        req = ProviderRequest(prompt="hello", system_prompt=persona)
+        await self.plugin.inject(FakeEvent(), req)
+        sep = chr(10) + chr(10)
+        self.assertTrue(req.system_prompt.startswith(persona + sep), repr(req.system_prompt))
+
+    async def test_disabled_first_call_preserves_unclosed_literal_marker(self):
+        self.plugin.config["llm_judgment_enabled"] = False
+        persona = "人设规范：讨论 XML 标签 <RelationArcRules> 时请保留下面的重要规则。" + chr(10) + "后续所有人设约束。"
+        req = ProviderRequest(prompt="hello", system_prompt=persona)
+        await self.plugin.inject(FakeEvent(), req)
+        self.assertEqual(persona, req.system_prompt)
+
+    async def test_foreign_parts_starting_same_marker_are_not_owned(self):
+        from astrbot.core.agent.message import TextPart
+        self.plugin.config["llm_judgment_enabled"] = False
+        foreign = TextPart(text="<RelationArcDynamicContext>外部插件引用样例</RelationArcDynamicContext>")
+        foreign_note = TextPart(text="<RelationArcTurnNote>外部插件规则</RelationArcTurnNote>")
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        req.extra_user_content_parts.extend([foreign, foreign_note])
+        await self.plugin.inject(FakeEvent(), req)
+        self.assertEqual([foreign, foreign_note], req.extra_user_content_parts)
+
+    async def test_disable_restores_original_persona_trailing_newlines(self):
+        persona = "原有人设" + chr(10) * 3
+        req = ProviderRequest(prompt="hello", system_prompt=persona)
+        await self.plugin.inject(FakeEvent(), req)
+        self.plugin.config["llm_judgment_enabled"] = False
+        await self.plugin.inject(FakeEvent(), req)
+        self.assertEqual(persona, req.system_prompt)
+
+    async def test_later_plugin_text_is_retained_byte_for_byte_on_disable(self):
+        req = ProviderRequest(prompt="hello", system_prompt="persona")
+        await self.plugin.inject(FakeEvent(), req)
+        tail = chr(10) + chr(10) + "<OtherPlugin>后置规则</OtherPlugin>"
+        req.system_prompt += tail
+        self.plugin.config["llm_judgment_enabled"] = False
+        await self.plugin.inject(FakeEvent(), req)
+        self.assertEqual("persona" + tail, req.system_prompt)
+
+    async def test_never_injected_request_is_completely_untouched_when_disabled(self):
+        # U01 acceptance: disabled + never owned -> request verbatim.
+        from astrbot.core.agent.message import TextPart
+        req = ProviderRequest(prompt="hello", system_prompt="p <RelationArcRules> unclosed")
+        part = TextPart(text="<RelationArcDynamicContext>x</RelationArcDynamicContext>")
+        req.extra_user_content_parts.append(part)
+        self.plugin.config["llm_judgment_enabled"] = False
+        await self.plugin.inject(FakeEvent(), req)
+        self.assertEqual("p <RelationArcRules> unclosed", req.system_prompt)
+        self.assertEqual([part], req.extra_user_content_parts)
+
+
 class InjectLifecycleTests(unittest.IsolatedAsyncioTestCase):
     """MIS-158/MIS-159: injection is idempotent and owns only its marked
     segments — repeated inject never stacks, a disabled gate removes the
@@ -2348,7 +2414,15 @@ class ConfigAccountEditTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("raw_delta_limit", (await body.get_data()).decode("utf-8"))
 
     def test_plugin_version_from_metadata(self):
-        self.assertEqual("0.1.0", self.plugin.plugin_version)
+        # U02: the expectation is read from this checkout's metadata.yaml
+        # declaration (single source of truth), keeping the read/parse
+        # boundary meaningful instead of pinning a stale literal.
+        import re as re_mod
+        match = re_mod.search(r"^version:\s*(.+)$",
+                              (ROOT / "metadata.yaml").read_text(encoding="utf-8"), re_mod.M)
+        declared = match.group(1).strip().strip('"').strip("'") if match else "UNPARSED"
+        self.assertNotEqual("UNPARSED", declared)
+        self.assertEqual(declared, self.plugin.plugin_version)
 
 
 if __name__ == "__main__":

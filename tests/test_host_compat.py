@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - depends on environment
     HAS_HOST = False
 
 from astrbot_plugin_relation_arc.main import PLUGIN_NAME, RelationArc  # noqa: E402
+from astrbot.api.provider import ProviderRequest  # noqa: E402
 from test_main import FakeContext  # noqa: E402
 
 
@@ -272,26 +273,65 @@ class HostCommandRegistrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_HOST, "astrbot host package not installed (missing dependency, not a failure)")
-class HostTempPartContractTests(unittest.TestCase):
-    """MIS-158: verify against the REAL host assembly/history code (not just
-    our mark_as_temp call) that plugin temporary parts reach the provider in
-    the current user message and are filtered out of persisted history."""
+class HostTempPartContractTests(unittest.IsolatedAsyncioTestCase):
+    """MIS-158/U03: drive the REAL chain — plugin inject on a real
+    ProviderRequest, the host's own assemble_context, Message validation and
+    the history dump filter — to prove the temporary dynamic block and
+    reminder reach the provider inside the current user message (after the
+    user text and other plugins' parts, before the image block) and never
+    persist to history, while the user text, foreign part and image do."""
 
-    def test_temp_parts_reach_provider_and_stay_out_of_history(self):
+    SYNTH_IMAGE = ("data:image/png;base64,"
+                   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+                   "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")
+
+    async def asyncSetUp(self):
+        import sys as _sys
+        self._tmp = tempfile.TemporaryDirectory()
+        _sys.path.insert(0, str(Path(__file__).parent))
+        from test_main import FakeContext, FakeEvent
+        self.plugin = RelationArc(FakeContext(self._tmp.name))
+        self.FakeEvent = FakeEvent
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+        self._tmp.cleanup()
+
+    async def test_real_chain_temp_parts_reach_provider_not_history(self):
         from astrbot.core.agent.message import Message, TextPart
         from astrbot.core.agent import message as message_mod
+        req = ProviderRequest(prompt="用户原文", system_prompt="persona",
+                              contexts=[{"role": "user", "content": "历史"}])
+        req.image_urls.append(self.SYNTH_IMAGE)
+        foreign = TextPart(text="<OtherPlugin>keep</OtherPlugin>")
+        req.extra_user_content_parts.append(foreign)
+        await self.plugin.inject(self.FakeEvent(), req)
 
-        part = TextPart(text="<RelationArcDynamicContext>x</RelationArcDynamicContext>").mark_as_temp()
-        req_system = "persona" + chr(10) + chr(10) + "<RelationArcRules>fixed</RelationArcRules>"
-        message = Message.model_validate({"role": "user", "content": [TextPart(text="hello"), part]})
-        # History dump (the function internal.py uses before persisting).
-        dumped = message_mod.dump_messages_with_checkpoints([message])
-        persisted_texts = [b.get("text") for b in dumped[0]["content"]]
-        self.assertIn("hello", persisted_texts)
-        self.assertNotIn("<RelationArcDynamicContext>", "".join(str(x) for x in persisted_texts))
-        # The temp flag itself is provider-facing only.
-        self.assertTrue(part._no_save)
-        self.assertIn("_no_save", part.model_dump_for_context())
+        # REAL host assembly (the method the agent runner uses).
+        assembled = await req.assemble_context()
+        self.assertEqual("user", assembled["role"])
+        blocks = assembled["content"]
+        texts = [b["text"] for b in blocks if b.get("type") == "text"]
+        self.assertTrue(any("用户原文" in t for t in texts))
+        self.assertTrue(any("<OtherPlugin>keep</OtherPlugin>" in t for t in texts))
+        self.assertTrue(any(t.startswith("<RelationArcDynamicContext>") for t in texts))
+        self.assertTrue(any(t.startswith("<RelationArcTurnNote>") for t in texts))
+        # Order: user text, foreign part, dynamic, reminder — image last.
+        self.assertLess(texts.index("用户原文"), next(i for i, t in enumerate(texts) if t.startswith("<RelationArcDynamicContext>")))
+        image_indexes = [i for i, b in enumerate(blocks) if b.get("type") == "image_url"]
+        self.assertEqual(1, len(image_indexes))
+        self.assertEqual(len(blocks) - 1, image_indexes[0])
+        self.assertIn("data:image/png", blocks[image_indexes[0]]["image_url"]["url"])
+
+        # REAL history persistence filter: temps gone, user/foreign/image kept.
+        persisted = message_mod.dump_messages_with_checkpoints(
+            [Message.model_validate(assembled)])[0]["content"]
+        ptexts = [b.get("text", "") for b in persisted if isinstance(b, dict) and b.get("type") == "text"]
+        self.assertTrue(any("用户原文" in t for t in ptexts))
+        self.assertTrue(any("<OtherPlugin>keep</OtherPlugin>" in t for t in ptexts))
+        self.assertFalse(any(t.startswith("<RelationArcDynamicContext>") for t in ptexts))
+        self.assertFalse(any(t.startswith("<RelationArcTurnNote>") for t in ptexts))
+        self.assertTrue(any(isinstance(b, dict) and b.get("type") == "image_url" for b in persisted))
 
 
 if __name__ == "__main__":

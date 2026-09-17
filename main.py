@@ -307,35 +307,48 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
                 lines.append(f"当前有效：{safety_labels.get(timed['level'], timed['level'])}（自动，剩余约 {minutes} 分钟）")
         return "\n".join(lines)
 
-    # MIS-158: markers delimiting this plugin's owned prompt segments. Only
-    # text between these exact markers is ever managed (added/replaced/
-    # removed); user text, similar examples and other plugins are untouched.
-    _FIXED_MARK = "<RelationArcRules>"
-    _DYNAMIC_MARK = "<RelationArcDynamicContext>"
-    _REMINDER_MARK = "<RelationArcTurnNote>"
+    # MIS-158/U01: ownership is tracked per request, never by literal tag
+    # text. The private attribute below records exactly what THIS plugin
+    # appended to the request: the precise system-prompt addition (separator
+    # + fixed block, byte-for-byte) and the exact part objects it created.
+    # Cleanup removes only those recorded additions; persona examples with
+    # the same markers, other plugins' parts and later appends are untouched.
+    _OWN_INJECTION_ATTR = "_relation_arc_own_injection"
 
     @classmethod
-    def _strip_own_system_block(cls, system_prompt: str) -> str:
-        """Remove this plugin's fixed rules block from a system prompt,
-        leaving the persona (and anything else) byte-identical."""
-        if not system_prompt or cls._FIXED_MARK not in system_prompt:
-            return system_prompt
-        start = system_prompt.index(cls._FIXED_MARK)
-        end_marker = "</RelationArcRules>"
-        end = system_prompt.find(end_marker, start)
-        end = (end + len(end_marker)) if end != -1 else len(system_prompt)
-        stripped = system_prompt[:start] + system_prompt[end:]
-        # Drop the separator this plugin added before the block.
-        return stripped[:-2].rstrip("\n") if stripped.endswith("\n\n") else stripped
+    def _own_injection(cls, req: ProviderRequest) -> dict | None:
+        record = getattr(req, cls._OWN_INJECTION_ATTR, None)
+        return record if isinstance(record, dict) else None
 
     @classmethod
-    def _remove_own_parts(cls, req: ProviderRequest) -> None:
-        """Drop this plugin's previous temporary parts (dynamic block and
-        per-turn reminder) from the request; other parts are untouched."""
-        req.extra_user_content_parts = [
-            part for part in (req.extra_user_content_parts or [])
-            if not (isinstance(part, TextPart) and isinstance(getattr(part, "text", None), str)
-                    and (part.text.startswith(cls._DYNAMIC_MARK) or part.text.startswith(cls._REMINDER_MARK)))]
+    def _rollback_own_injection(cls, req: ProviderRequest) -> None:
+        """Remove exactly what this plugin previously added to THIS request.
+
+        The system addition is removed as one exact substring (prefer the
+        suffix; fall back to a single splice anywhere in the string, which
+        only ever matches the bytes we appended and keeps text other
+        plugins appended before/after it). The temporary parts are removed
+        by object identity — no text matching at all. With no record (this
+        request was never injected by us) the request is left untouched."""
+        record = cls._own_injection(req)
+        if record is None:
+            return
+        added_system = record.get("system_added")
+        if added_system:
+            current = req.system_prompt or ""
+            if current.endswith(added_system):
+                req.system_prompt = current[:-len(added_system)]
+            elif added_system in current:
+                # Someone appended after our block: splice out only our
+                # exact bytes and keep their suffix intact.
+                req.system_prompt = current.replace(added_system, "", 1)
+        own_parts = record.get("parts") or []
+        if own_parts:
+            own_ids = {id(part) for part in own_parts}
+            req.extra_user_content_parts = [
+                part for part in (req.extra_user_content_parts or [])
+                if id(part) not in own_ids]
+        setattr(req, cls._OWN_INJECTION_ATTR, None)
 
     @filter.on_llm_request()
     async def inject(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -345,12 +358,12 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # Pin the turn before any gate so the response settles in the request's
         # own context even if Pages config changes mid-turn.
         self._pin_turn_context(event)
-        # MIS-158 lifecycle: injection is idempotent — previous own segments
-        # (fixed system block, dynamic part, reminder part) are removed first,
-        # so repeated inject never stacks; a disabled gate leaves the request
-        # clean of our previous turn's segments.
-        req.system_prompt = self._strip_own_system_block(req.system_prompt or "")
-        self._remove_own_parts(req)
+        # MIS-158 lifecycle (U01 ownership): injection is idempotent — the
+        # previous own additions recorded on THIS request are rolled back by
+        # reference before anything new is added; a disabled gate leaves the
+        # request exactly as it was (a request we never injected is not
+        # touched at all).
+        self._rollback_own_injection(req)
         if not self._enabled(event) or not self.config.get("llm_judgment_enabled", True): return
         account = self.store.account(identity, scope_kind, scope_id)
         values, state = account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"])
@@ -377,9 +390,18 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # persona); the per-turn dynamic context and the short format
         # reminder stay temporary parts of the current user message.
         fixed_block = relation_prompts.fixed_rules_block()
-        req.system_prompt = (req.system_prompt + "\n\n" + fixed_block) if req.system_prompt else fixed_block
-        req.extra_user_content_parts.append(TextPart(text=dynamic_prompt).mark_as_temp())
-        req.extra_user_content_parts.append(TextPart(text=reminder).mark_as_temp())
+        system_before = req.system_prompt or ""
+        system_added = ("\n\n" + fixed_block) if system_before else fixed_block
+        req.system_prompt = system_before + system_added
+        dynamic_part = TextPart(text=dynamic_prompt).mark_as_temp()
+        reminder_part = TextPart(text=reminder).mark_as_temp()
+        req.extra_user_content_parts.append(dynamic_part)
+        req.extra_user_content_parts.append(reminder_part)
+        # U01: record the exact additions owned by this plugin on THIS
+        # request so a later inject (repeat or disable) rolls back precisely
+        # these bytes and objects — never anything matched by tag text.
+        setattr(req, self._OWN_INJECTION_ATTR,
+                {"system_added": system_added, "parts": [dynamic_part, reminder_part]})
 
     def _read_and_strip_judgment(self, response: LLMResponse, user_text: str):
         """Read the final provider payload without assuming completion_text is used.

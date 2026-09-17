@@ -1,19 +1,42 @@
 {
   "baseline_commit": "913ca59",
   "note_chars_not_tokens": true,
+  "shared_inputs": "visibility x exclusivity policy; occupancy=False; binding text produced by each side's own builder",
   "personas": {
     "empty": {
-      "hidden_turn": {
-        "baseline_per_turn_chars": 1831,
+      "hidden_exclusivity_off": {
+        "baseline_per_turn_chars": 1832,
+        "baseline_total_chars": 1832,
         "baseline_stable_prefix_chars": 0,
         "candidate_system_fixed_chars": 1192,
-        "candidate_per_turn_chars": 839,
-        "candidate_total_chars": 2031,
+        "candidate_per_turn_chars": 840,
+        "candidate_total_chars": 2032,
         "candidate_stable_prefix_chars": 1192,
         "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
       },
-      "shown_turn": {
+      "hidden_exclusivity_on": {
+        "baseline_per_turn_chars": 1857,
+        "baseline_total_chars": 1857,
+        "baseline_stable_prefix_chars": 0,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 865,
+        "candidate_total_chars": 2057,
+        "candidate_stable_prefix_chars": 1192,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_exclusivity_off": {
         "baseline_per_turn_chars": 1903,
+        "baseline_total_chars": 1903,
+        "baseline_stable_prefix_chars": 0,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 928,
+        "candidate_total_chars": 2120,
+        "candidate_stable_prefix_chars": 1192,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_exclusivity_on": {
+        "baseline_per_turn_chars": 1928,
+        "baseline_total_chars": 1928,
         "baseline_stable_prefix_chars": 0,
         "candidate_system_fixed_chars": 1192,
         "candidate_per_turn_chars": 953,
@@ -23,17 +46,39 @@
       }
     },
     "persona": {
-      "hidden_turn": {
-        "baseline_per_turn_chars": 1831,
+      "hidden_exclusivity_off": {
+        "baseline_per_turn_chars": 1832,
+        "baseline_total_chars": 1832,
         "baseline_stable_prefix_chars": 10,
         "candidate_system_fixed_chars": 1192,
-        "candidate_per_turn_chars": 839,
-        "candidate_total_chars": 2031,
+        "candidate_per_turn_chars": 840,
+        "candidate_total_chars": 2032,
         "candidate_stable_prefix_chars": 1204,
         "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
       },
-      "shown_turn": {
+      "hidden_exclusivity_on": {
+        "baseline_per_turn_chars": 1857,
+        "baseline_total_chars": 1857,
+        "baseline_stable_prefix_chars": 10,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 865,
+        "candidate_total_chars": 2057,
+        "candidate_stable_prefix_chars": 1204,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_exclusivity_off": {
         "baseline_per_turn_chars": 1903,
+        "baseline_total_chars": 1903,
+        "baseline_stable_prefix_chars": 10,
+        "candidate_system_fixed_chars": 1192,
+        "candidate_per_turn_chars": 928,
+        "candidate_total_chars": 2120,
+        "candidate_stable_prefix_chars": 1204,
+        "candidate_fixed_sha256": "7cb951e16c348ac0a8dd461fbb5349b5c9c22c5e042f171e9f339dd15a3a51d2"
+      },
+      "shown_exclusivity_on": {
+        "baseline_per_turn_chars": 1928,
+        "baseline_total_chars": 1928,
         "baseline_stable_prefix_chars": 10,
         "candidate_system_fixed_chars": 1192,
         "candidate_per_turn_chars": 953,
@@ -43,6 +88,5 @@
       }
     }
   },
-  "scenarios": {},
   "fixed_block_stable_across_scenarios": true
 }
