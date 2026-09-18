@@ -1,210 +1,91 @@
-"""MIS-158/159/U03 full-request evidence: complete request snapshots with the
-REAL host assembly and history-persistence chain (not just prompt fragments).
+"""Export equivalent synthetic inputs through actual inject/assembly/history chains.
 
-Per scenario this records, for BOTH sides (baseline 913ca59 vs candidate):
-- inputs: user prompt, preset history contexts, data-URI image, pre-existing
-  other-plugin parts, persona/system, scenario + effective-policy state,
-  plugin commit and host version;
-- post-inject: final system_prompt and extra_user_content_parts;
-- REAL host assembly: ``await req.assemble_context()`` — the same method the
-  agent runner uses to build the provider user message;
-- history persistence: ``dump_messages_with_checkpoints([Message.model_validate(
-  assembled)])`` — the same filter the host applies before saving, proving the
-  temporary dynamic block and reminder never persist while the user text,
-  other-plugin part and image block survive.
-
-Scenarios match the fragment matrix: empty system / persona + repeat inject /
-other-plugin parts / disable+reenable / session scope / route shown / policy
-exclusivity on. Run with the host venv python; the image is a synthetic 1x1
-data URI (no network).
-
-Usage: python tools/prompt_samples_dump_full.py [--out tools/prompt_samples]
+Run this candidate tool with --repo for each pinned baseline/candidate checkout.
+No production data or provider call. Source hashes distinguish dirty code from HEAD.
 """
-from __future__ import annotations
-
 import argparse
 import asyncio
-import importlib.metadata
+import copy
+import hashlib
 import json
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT.parent))
-sys.path.insert(0, str(ROOT / "tests"))
-
-from astrbot.api.provider import ProviderRequest  # noqa: E402
-from astrbot.core.agent.message import Message, TextPart  # noqa: E402
-from astrbot.core.agent import message as message_mod  # noqa: E402
-
-from test_main import FakeContext, FakeEvent  # noqa: E402
-from astrbot_plugin_relation_arc.main import RelationArc  # noqa: E402
-
-SYNTH_IMAGE = ("data:image/png;base64,"
-               "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
-               "YGBgAAAABQABh6FO1AAAAABJRU5ErkJggg==")  # 1x1 synthetic PNG
-PRESET_HISTORY = [
-    {"role": "user", "content": "之前的合成对话"},
-    {"role": "assistant", "content": "好的合成回复"},
-]
+import tempfile
+import prompt_runtime as rt
 
 
-def _git_commit() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], encoding="utf-8").strip()
-    except Exception:
-        return "unknown"
+def scenarios():
+    common = dict(text='用户原文', image=True, persona='ordinary')
+    return {name: rt.scenario(**{**common, **options}, name=name) for name, options in {
+        'empty_system': {'persona': ''},
+        'persona_repeat_inject': {},
+        'other_plugin_parts': {'persona': rt.PERSONAS['ordinary'] + '\n<OtherPlugin>x</OtherPlugin>'},
+        'disable_reenable': {}, 'session_scope': {'session': True},
+        'route_shown_eligible': {'session': True},
+        'policy_exclusivity_on': {'session': True},
+    }.items()}
 
 
-def _host_version() -> str:
-    try:
-        return importlib.metadata.version("astrbot")
-    except Exception:
-        return "unknown"
-
-
-def _policy_state(plugin) -> dict:
-    p = plugin.store.active_binding_policy()
-    return {"exclusivity": p["exclusivity"], "rebind_cooldown": p["rebind_cooldown"],
-            "epoch": p["epoch"]}
-
-
-async def _snapshot(plugin, req, scenario: str) -> dict:
-    assembled = await req.assemble_context()
-    message = Message.model_validate(assembled)
-    persisted = message_mod.dump_messages_with_checkpoints([message])
-    return {
-        "scenario": scenario,
-        "system_prompt": req.system_prompt,
-        "extra_user_content_parts": [
-            {"text": part.text, "temp": bool(getattr(part, "_no_save", False))}
-            for part in req.extra_user_content_parts],
-        "assembled_user_message": assembled,
-        "history_persisted": persisted,
-    }
-
-
-async def _run_scenario(name: str, build) -> dict:
-    temp = tempfile.TemporaryDirectory()
-    plugin = RelationArc(FakeContext(temp.name))
-    try:
-        record = await build(plugin)
-        record["plugin_commit"] = _git_commit()
-        record["host_version"] = _host_version()
-        record["effective_policy"] = _policy_state(plugin)
-        return record
-    finally:
-        await plugin.terminate()
-        temp.cleanup()
-
-
-def _new_req(system_prompt: str = "persona") -> ProviderRequest:
-    req = ProviderRequest(prompt="用户原文", system_prompt=system_prompt,
-                          contexts=list(PRESET_HISTORY))
-    req.image_urls.append(SYNTH_IMAGE)
-    return req
-
-
-async def scenario_empty_system(plugin):
-    req = _new_req(system_prompt="")
-    await plugin.inject(FakeEvent(), req)
-    return await _snapshot(plugin, req, "empty_system")
-
-
-async def scenario_persona_repeat(plugin):
-    req = _new_req()
-    await plugin.inject(FakeEvent(), req)
-    first = await _snapshot(plugin, req, "persona_repeat_inject:first")
-    plugin.store.set_dimension("qq-adapter:user-1", "global", "", "trust", 432)
-    await plugin.inject(FakeEvent(), req)
-    second = await _snapshot(plugin, req, "persona_repeat_inject:second")
-    return {"first": first, "second": second}
-
-
-async def scenario_other_plugin(plugin):
-    req = _new_req(system_prompt="persona\n<OtherPlugin>x</OtherPlugin>")
-    req.extra_user_content_parts.append(TextPart(text="<Other>keep</Other>"))
-    await plugin.inject(FakeEvent(), req)
-    await plugin.inject(FakeEvent(), req)
-    return await _snapshot(plugin, req, "other_plugin_parts")
-
-
-async def scenario_disable_reenable(plugin):
-    req = _new_req()
-    await plugin.inject(FakeEvent(), req)
-    plugin.config["llm_judgment_enabled"] = False
-    await plugin.inject(FakeEvent(), req)
-    disabled = await _snapshot(plugin, req, "disable_reenable:disabled")
-    plugin.config["llm_judgment_enabled"] = True
-    await plugin.inject(FakeEvent(), req)
-    reenabled = await _snapshot(plugin, req, "disable_reenable:reenabled")
-    return {"disabled": disabled, "reenabled": reenabled}
-
-
-async def scenario_session(plugin):
-    plugin.config["is_global_relation"] = False
-    req = _new_req()
-    event = FakeEvent()
-    await plugin.inject(event, req)
-    return await _snapshot(plugin, req, "session_scope")
-
-
-async def scenario_route_shown(plugin):
-    plugin.config["is_global_relation"] = False
-    req = _new_req()
-    event = FakeEvent()
-    await plugin.inject(event, req)
-    scope = ("session", event.unified_msg_origin)
-    plugin.store.set_state("qq-adapter:user-1", *scope,
-                           romance_policy="shown", romance_state="eligible")
-    for key, value in {"trust": 600, "comfort": 600, "closeness": 500,
-                       "resonance": 500}.items():
-        plugin.store.set_dimension("qq-adapter:user-1", *scope, key, value)
-    await plugin.inject(event, req)
-    return await _snapshot(plugin, req, "route_shown_eligible")
-
-
-async def scenario_policy_exclusivity(plugin):
-    plugin.config["is_global_relation"] = False
-    req = _new_req()
-    event = FakeEvent()
-    await plugin.inject(event, req)
-    plugin.store.activate_binding_policy({"exclusivity": "scope", "rebind_cooldown": "off"})
-    await plugin.inject(event, req)
-    return await _snapshot(plugin, req, "policy_exclusivity_on")
-
-
-SCENARIOS = {
-    "full_request_empty_system": scenario_empty_system,
-    "full_request_persona_repeat_inject": scenario_persona_repeat,
-    "full_request_other_plugin_parts": scenario_other_plugin,
-    "full_request_disable_reenable": scenario_disable_reenable,
-    "full_request_session_scope": scenario_session,
-    "full_request_route_shown_eligible": scenario_route_shown,
-    "full_request_policy_exclusivity_on": scenario_policy_exclusivity,
-}
-
-
-async def _run_all(out_dir: Path) -> None:
-    for name, build in SCENARIOS.items():
-        record = await _run_scenario(name, build)
-        (out_dir / f"{name}.json").write_text(
-            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        print("saved", name)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", default=str(ROOT / "tools" / "prompt_samples"))
-    args = parser.parse_args()
-    out_dir = Path(args.out)
+async def export(repo, out_dir, side, expected_commit=None):
+    source = rt.source_info(repo, expected_commit)
+    plugin_type = rt.load_plugin(repo)
     out_dir.mkdir(parents=True, exist_ok=True)
-    asyncio.run(_run_all(out_dir))
-    return 0
+    records = []
+    for name, spec in scenarios().items():
+        with tempfile.TemporaryDirectory(prefix='relation-sample-') as directory:
+            plugin = plugin_type(rt.SyntheticContext(directory))
+            try:
+                event = rt.configure(plugin, spec)
+                req = rt.new_request(spec)
+                record = dict(format_version=2, side=side, scenario=name, inputs=copy.deepcopy(spec),
+                    source=source, host_version=rt.host_version(), snapshots=[])
+                async def capture(phase):
+                    await plugin.inject(event, req)
+                    kind, scope = plugin._scope(event)
+                    account = plugin.store.account(plugin._identity(event), kind, scope)
+                    policy = plugin.store.active_binding_policy()
+                    record['snapshots'].append(dict(phase=phase, request=await rt.snapshot(req),
+                        state_inputs=dict(values=account['values'], scope_kind=kind,
+                            enabled=plugin.config['llm_judgment_enabled'],
+                            romance_policy=account['state']['romance_policy'],
+                            romance_state=account['state']['romance_state'],
+                            exclusivity=policy['exclusivity'], rebind_cooldown=policy['rebind_cooldown'])))
+                await capture('initial')
+                if name in ('persona_repeat_inject', 'other_plugin_parts'):
+                    kind, scope = plugin._scope(event)
+                    plugin.store.set_dimension(plugin._identity(event), kind, scope, 'trust', 432)
+                    await capture('refreshed')
+                elif name == 'disable_reenable':
+                    plugin.config['llm_judgment_enabled'] = False
+                    await capture('disabled')
+                    plugin.config['llm_judgment_enabled'] = True
+                    await capture('reenabled')
+                elif name == 'route_shown_eligible':
+                    rt.configure(plugin, {**spec, 'visible': True, 'eligible': True,
+                        'values': {'trust': 850, 'comfort': 850, 'closeness': 850, 'resonance': 750}})
+                    await capture('route_shown_eligible')
+                elif name == 'policy_exclusivity_on':
+                    plugin.store.activate_binding_policy({'exclusivity': 'scope', 'rebind_cooldown': 'off'})
+                    await capture('exclusivity_on')
+                record['generator_sha256'] = rt.digest({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                                        for p in (Path(__file__), Path(rt.__file__))})
+                (out_dir / f'{side}_full_request_{name}.json').write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2), encoding='utf-8')
+                records.append(record)
+            finally:
+                await plugin.terminate()
+    return records
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--repo', type=Path, required=True)
+    p.add_argument('--expected-commit')
+    p.add_argument('--side', choices=['baseline', 'candidate'], required=True)
+    p.add_argument('--out', type=Path, required=True)
+    a = p.parse_args()
+    records = asyncio.run(export(a.repo.resolve(), a.out, a.side, a.expected_commit))
+    print(f'Exported {len(records)} full-request scenarios; no model called.')
+
+
+if __name__ == '__main__':
+    main()
