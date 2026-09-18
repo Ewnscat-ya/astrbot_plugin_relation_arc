@@ -1,0 +1,48 @@
+{
+  "host_version": "4.28.0",
+  "baseline": {
+    "commit": "913ca59036267de2bcc481b8910b5f6fc8044f91",
+    "source_sha256": "4b96fa5c77048c77dd6693f1651010e6a2fd9909c8d9d219738c1a981b341add",
+    "files": {
+      "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "commands.py": "d27223d6a24cab90d5d5d01dad1f69084d3d650baa0ee34490ffe65c5eea070e",
+      "config_manager.py": "f994988ae0a5a5ceffc628d9cf26004f443b094101b21d472fc7cb5499c7f09a",
+      "main.py": "7f81c468fcf7e0eaea8ad97b6091d35637a72607e2e3b0c9941d72f519e0bc06",
+      "pages_api.py": "b421d66c155c5cb28063f9d374985b8e130d9c771ce66831cc9a295bf6de85c3",
+      "prompts.py": "445b92a1869f614951a1a51d0f0b9c2eda4d780a391fd738661f3621f43160a2",
+      "relation_engine.py": "c6bdc49fae6a867b90a0d19709b38a6aec05889f5f3b7a77cd40ada68abeecc6",
+      "relation_protocol.py": "049456311f52bd850379673ff3e7fd00daaed899ca25e22bd181c817c5db6b8a",
+      "relation_store.py": "f7bbe9bc176a6d7897e6f6b7fc7bd19dea5327837a8c0888a46d1722ff6313ef",
+      "relationship_types.py": "c70115ea9e41b094b6b0886abadb7a396bbc9fe0c698051e050d78fd51e29605",
+      "metadata.yaml": "1fee1997e5f2f7f27132695ac682b151092ab60025bd16e1a5a191e1a3f3189a"
+    },
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "56e5985e657ff4e830de59df45eb0c2b2270035e",
+    "source_sha256": "355db222b55886fc8f6c730c12fb3c3b63d2b339a4bba82eacd2c664619cca96",
+    "files": {
+      "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "commands.py": "d27223d6a24cab90d5d5d01dad1f69084d3d650baa0ee34490ffe65c5eea070e",
+      "config_manager.py": "f994988ae0a5a5ceffc628d9cf26004f443b094101b21d472fc7cb5499c7f09a",
+      "main.py": "971561b4217c565d12a8ed951920b0306fc2e0feb866f46d5fbdb7fcc6a74aa9",
+      "pages_api.py": "b421d66c155c5cb28063f9d374985b8e130d9c771ce66831cc9a295bf6de85c3",
+      "prompts.py": "a8e09db8abf09d5f98d42551de568f2a7754f030816c0c62d9af85afc3a4ff5e",
+      "relation_engine.py": "c6bdc49fae6a867b90a0d19709b38a6aec05889f5f3b7a77cd40ada68abeecc6",
+      "relation_protocol.py": "049456311f52bd850379673ff3e7fd00daaed899ca25e22bd181c817c5db6b8a",
+      "relation_store.py": "f7bbe9bc176a6d7897e6f6b7fc7bd19dea5327837a8c0888a46d1722ff6313ef",
+      "relationship_types.py": "c70115ea9e41b094b6b0886abadb7a396bbc9fe0c698051e050d78fd51e29605",
+      "metadata.yaml": "8c1101ef7c5a354e219e2d51eb7cb69848b5a8ab2a21787311a22a1d9b42149f"
+    },
+    "dirty": false
+  },
+  "real_model": "NOT RUN",
+  "baseline_frozen_sha256": "0393c2dea15895d91c57d3e1261cc19c93314bc0fc1c8b1a1017efb7329f750a",
+  "baseline_compatibility_cases": 8,
+  "candidate_frozen_sha256": "0393c2dea15895d91c57d3e1261cc19c93314bc0fc1c8b1a1017efb7329f750a",
+  "candidate_compatibility_cases": 8,
+  "frozen_equal": true,
+  "paired_request_snapshots": 13,
+  "offline_calls_per_side": 60,
+  "source_unchanged": true
+}

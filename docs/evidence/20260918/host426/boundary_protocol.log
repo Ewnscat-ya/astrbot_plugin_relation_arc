@@ -1,0 +1,28 @@
+[32m[12:40:10.097][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.108][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+test_different_first_evidence_does_not_decay_only_on_signature (__main__.RepeatKeyBoundaryTests.test_different_first_evidence_does_not_decay_only_on_signature) ... ok
+[32m[12:40:10.137][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.146][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.157][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.165][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:608]: [1m[关系弧线] settlement=zero_after_policy binding=None[0m
+test_first_evidence_absent_later_present_uses_signature (__main__.RepeatKeyBoundaryTests.test_first_evidence_absent_later_present_uses_signature) ... ok
+[32m[12:40:10.194][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.204][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.213][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:632]: [1m[关系弧线] settlement=applied dimensions=respect,trust binding=no_binding[0m
+[32m[12:40:10.220][0m [Core] [1m[INFO][0m [astrbot_plugin_relation_arc.main:608]: [1m[关系弧线] settlement=zero_after_policy binding=None[0m
+test_first_evidence_stable_later_evidence_changes_still_decays (__main__.RepeatKeyBoundaryTests.test_first_evidence_stable_later_evidence_changes_still_decays) ... ok
+test_bare_protocol_three_parts_and_empty_parts_do_not_leak (__main__.RichBoundaryTests.test_bare_protocol_three_parts_and_empty_parts_do_not_leak) ... ok
+test_completion_bare_json_removal (__main__.RichBoundaryTests.test_completion_bare_json_removal) ... ok
+test_completion_multiple_blocks_uses_last_and_keeps_prose (__main__.RichBoundaryTests.test_completion_multiple_blocks_uses_last_and_keeps_prose) ... ok
+test_ordinary_text_and_arbitrary_json_preserve_original_chain (__main__.RichBoundaryTests.test_ordinary_text_and_arbitrary_json_preserve_original_chain) ... ok
+test_result_chain_is_authoritative_over_backing_completion (__main__.RichBoundaryTests.test_result_chain_is_authoritative_over_backing_completion) ... ok
+test_tagged_protocol_three_parts_does_not_lose_prose (__main__.RichBoundaryTests.test_tagged_protocol_three_parts_does_not_lose_prose) ... ok
+test_truncated_tail_three_parts_does_not_leak (__main__.RichBoundaryTests.test_truncated_tail_three_parts_does_not_leak) ... ok
+test_unclosed_opener_with_ordinary_prose_remains_visible (__main__.RichBoundaryTests.test_unclosed_opener_with_ordinary_prose_remains_visible) ... ok
+test_whole_block_with_newline_preserves_component_order (__main__.RichBoundaryTests.test_whole_block_with_newline_preserves_component_order) ... ok
+test_whole_block_without_boundary_whitespace_preserves_component_order (__main__.RichBoundaryTests.test_whole_block_without_boundary_whitespace_preserves_component_order) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.160s
+
+OK

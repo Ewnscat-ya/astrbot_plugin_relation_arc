@@ -1,0 +1,12 @@
+PASS first save posts revision 0
+PASS conflict reloads the latest config
+PASS rebuilt inputs carry fresh values
+PASS conflict message shown
+PASS retry posts fresh revision 1 and is accepted
+PASS accounts uses a pure endpoint + params
+PASS page links rendered
+PASS preventDefault is called
+PASS clicking page 2 requests page=2
+PASS identical concurrent renders share one bridge call
+PASS audit uses a pure endpoint + params
+PASS bindings uses a pure endpoint + params
