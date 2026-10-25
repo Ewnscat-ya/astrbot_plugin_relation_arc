@@ -1,317 +1,312 @@
-"""MIS-161 real-model A/B comparison runner (executable; U05 rewrite).
+"""Full-request A/B runner. Reproducible commands: docs/MODEL_AB.md.
 
-Measures baseline (913ca59) vs candidate plugin prompt layouts against the
-SAME provider/model/params/preset history. No keys in source: the real
-adapter uses whatever provider the isolated AstrBot environment already has
-configured; a --dry-run fake adapter exercises the whole chain offline.
-
-Protocol comparability rules baked in:
-- FIXED preset history (constant synthetic script); model outputs are never
-  fed back, so the two sides can never accumulate divergent random history.
-- cold = first request on this prefix in the process; warm = the same
-  prefix sent --warmup N times before the measured call.
-- provider-reported usage recorded per request; cache hit/miss tokens are
-  kept ONLY when the provider actually reports them — a missing field is
-  recorded as null and NEVER as 0%.
-- protocol validity requires exactly one <relation_judgment> block, at the
-  first line, with a parseable schema-3 payload (not just "no parser error").
-- cost is filled only when --price-json gives a reliable price source.
-- >= 20 scenarios x 3 repeats by default; pass --scenarios/--repeats to fit
-  the authorized budget and report what actually ran.
-
-Exit codes: 0 ok; 2 not-ran/invalid (never a silent fake success).
-
-Usage (plugin parent directory, host venv python):
-    # offline chain check (no network, no model):
-    python tools/model_ab_test.py run --side candidate --adapter fake --out ab_candidate_dry.json
-    # real runs inside the authorized isolated environment:
-    git -C astrbot_plugin_relation_arc checkout 913ca59
-    python tools/model_ab_test.py run --side baseline --out ab_baseline.json
-    git -C astrbot_plugin_relation_arc checkout <candidate>
-    python tools/model_ab_test.py run --side candidate --out ab_candidate.json
-    # summarize (refuses non-ran or empty sides):
-    python tools/model_ab_test.py compare ab_baseline.json ab_candidate.json
+--repo selects the actual plugin checkout; keep this runner in the candidate.
+Real execution needs an explicit configured-provider factory and authorization.
+There is no automatic provider construction or credential discovery.
 """
 from __future__ import annotations
-
 import argparse
 import asyncio
-import hashlib
+import copy
+import importlib.util
+import inspect
 import json
-import statistics
-import subprocess
-import sys
-import time
 from pathlib import Path
-from typing import Any, Protocol
+import re
+import statistics
+import sys
+import tempfile
+import time
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT.parent))
-sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prompt_runtime as runtime
+from provider_adapters import HostAdapter, FakeAdapter, normalize_usage, number
 
-DEFAULT_SCENARIOS = [
-    "你好呀", "谢谢你昨天帮我", "哼，才不是特意来找你", "你能不能别开这种玩笑",
-    "我给你带了点特产", "我们在一起吧", "今天天气不错", "哈哈哈哈哈",
-    "你再夸我一句试试", "我觉得你比以前温柔了", "帮我看看这个问题", "晚安",
-    "早上好！", "你还记得我上次说的话吗", "我有点难过", "你最近在忙什么",
-    "这个梗好笑吧", "别不理我嘛", "我们做个好朋友吧", "你决定就好",
-]
-PRESET_HISTORY = [
-    {"role": "user", "content": "之前的合成对话"},
-    {"role": "assistant", "content": "好的合成回复"},
-]
+ROOT = runtime.ROOT
+DIMENSIONS = {'trust', 'respect', 'comfort', 'closeness', 'resonance', 'romance_interest'}
 
 
-class ProviderAdapter(Protocol):
-    """The seam real/fake providers plug into. complete() returns
-    (text, usage) where usage is a dict or None; missing cache fields stay
-    missing — the runner never coerces them to zero."""
-
-    name: str
-
-    async def complete(self, system_prompt: str, user_text: str) -> tuple[str, dict | None]: ...
-
-
-class FakeAdapter:
-    """Offline deterministic stand-in: emits a protocol-shaped reply. Used
-    only by --dry-run/--adapter fake to verify the executable chain end to
-    end; results are marked adapter=fake and are NOT model measurements."""
-
-    name = "fake-offline"
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def complete(self, system_prompt: str, user_text: str) -> tuple[str, dict | None]:
-        self.calls += 1
-        digest = hashlib.sha256(user_text.encode("utf-8")).hexdigest()[:6]
-        text = ('<relation_judgment>{"schema_version":3,"fact_effects":[{"effects":{"trust":'
-                + str(int(digest[0], 16) % 5) + '}}],"relationship_proposal":null,'
-                '"interaction_safety_proposal":null}</relation_judgment>好的。')
-        return text, {"input_tokens": None, "output_tokens": None,
-                      "prompt_cache_hit_tokens": None, "prompt_cache_miss_tokens": None}
+def _valid_payload(p, allowed):
+    if not isinstance(p, dict) or type(p.get('schema_version')) is not int or p['schema_version'] != 3:
+        return False
+    facts = p.get('fact_effects')
+    if not isinstance(facts, list) or len(facts) > 64:
+        return False
+    for fact in facts:
+        if not isinstance(fact, dict) or not isinstance(fact.get('effects'), dict):
+            return False
+        if any(k not in allowed or type(v) is not int or not 0 < abs(v) <= 10 for k, v in fact['effects'].items()):
+            return False
+        if any(k in fact and not isinstance(fact[k], str) for k in ('evidence', 'reason')):
+            return False
+    proposal = p.get('relationship_proposal')
+    if proposal is not None and (not isinstance(proposal, dict) or proposal.get('action') != 'bind'
+        or proposal.get('type_id') not in {'friend', 'close_friend', 'partner', 'romantic_partner', 'spouse'}
+        or proposal.get('origin') not in {'user_request', 'character_initiated', 'mutual_dialogue'}
+        or proposal.get('mutuality') not in {'clear', 'insufficient'}):
+        return False
+    safety = p.get('interaction_safety_proposal')
+    if safety is not None and (not isinstance(safety, dict)
+        or safety.get('level') not in {'slow_down', 'pause_intimacy'}
+        or safety.get('reason_code') not in {'boundary_pressure', 'repeated_escalation', 'hostility'}):
+        return False
+    return True
 
 
-def _try_host_adapter() -> ProviderAdapter | None:
-    """Attempt to bind the host's configured provider (isolated env only).
-    Returns None with a reason when unavailable — never fabricates."""
-    class HostAdapter:
-        name = "host-provider"
+def _measure(text, user_text='', allowed_dimensions=None):
+    text = text if isinstance(text, str) else ''
+    opens = len(re.findall(r'<relation_judgment>', text, re.I))
+    closes = len(re.findall(r'</relation_judgment>', text, re.I))
+    blocks = list(re.finditer(r'<relation_judgment>(.*?)</relation_judgment>', text, re.S))
+    first = text.split('\n', 1)[0]
+    first_line = bool(re.fullmatch(r'[ \t]*<relation_judgment>.*</relation_judgment>[ \t\r]*', first))
+    schema3 = False
+    if len(blocks) == 1 and len(blocks[0].group(1)) <= 65536:
+        try:
+            schema3 = _valid_payload(json.loads(blocks[0].group(1)),
+                                    DIMENSIONS if allowed_dimensions is None else allowed_dimensions)
+        except (ValueError, RecursionError, TypeError):
+            pass
+    return dict(protocol_valid=opens == closes == len(blocks) == 1 and first_line and schema3,
+                first_line=first_line, schema3=schema3, omitted=opens == 0,
+                duplicate_blocks=opens > 1 or closes > 1)
 
-        def __init__(self, provider) -> None:
-            self._provider = provider
 
-        async def complete(self, system_prompt: str, user_text: str) -> tuple[str, dict | None]:
-            from astrbot.core.provider.entities import ProviderRequest
-            req = ProviderRequest(prompt=user_text, system_prompt=system_prompt,
-                                  contexts=list(PRESET_HISTORY))
-            resp = await self._provider.text_chat(**{
-                "prompt": req.prompt, "session_id": "ab-test", "contexts": PRESET_HISTORY,
-                "system_prompt": system_prompt})
-            text = getattr(resp, "completion_text", "") or ""
-            usage = getattr(resp, "usage", None)
-            usage_dict = None
-            if isinstance(usage, dict):
-                usage_dict = {k: usage.get(k) for k in
-                              ("input_tokens", "output_tokens",
-                               "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")}
-            elif usage is not None:
-                usage_dict = {"raw": str(usage)}
-            return text, usage_dict
+def _write(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + '.writing')
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    for attempt in range(5):
+        try:
+            temp.replace(path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.025 * (2 ** attempt))
 
-    try:
-        from astrbot.core.provider.provider import Provider
-        provider = Provider()
-        return HostAdapter(provider)
-    except Exception as exc:
-        print(f"[model_ab_test] host provider unavailable: {exc}", file=sys.stderr)
+
+def _cost(r, p):
+    if not p or not p.get('source') or not p.get('currency') or any(
+        number(r.get(k)) is None for k in ('input_tokens', 'output_tokens')):
         return None
+    if p.get('mode') == 'cache':
+        if any(number(p.get(k)) is None for k in ('cache_hit_per_1k', 'cache_miss_per_1k', 'output_per_1k')) or any(
+            number(r.get(k)) is None for k in ('cache_hit_tokens', 'cache_miss_tokens')):
+            return None
+        if r['cache_hit_tokens'] + r['cache_miss_tokens'] != r['input_tokens']:
+            return None
+        cost = r['cache_hit_tokens'] * p['cache_hit_per_1k'] + r['cache_miss_tokens'] * p['cache_miss_per_1k']
+    elif p.get('mode') == 'flat' and all(number(p.get(k)) is not None for k in ('input_per_1k', 'output_per_1k')):
+        cost = r['input_tokens'] * p['input_per_1k']
+    else:
+        return None
+    return (cost + r['output_tokens'] * p['output_per_1k']) / 1000
 
 
-def _git_commit() -> str:
+async def run_side(side, adapter, repeats, scenarios, warmup, price, out_path, *,
+                   repo=ROOT, expected_commit=None, timeout=120):
+    payload = dict(format_version=2, side=side, ran=False, completed=False, records=[])
+    _write(out_path, payload)
     try:
-        return subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
-                                       encoding="utf-8").strip()
-    except Exception:
-        return "unknown"
-
-
-def _measure(text: str, user_text: str) -> dict:
-    """Protocol metrics: exactly one block, first line, schema-3 payload."""
-    stripped = text.lstrip()
-    first_line = stripped.split("\n", 1)[0]
-    blocks = text.count("<relation_judgment>")
-    from astrbot_plugin_relation_arc.relation_protocol import parse_response
-    parsed = parse_response(text, user_text, 10)
-    schema3 = (getattr(parsed, "stats", None) or {}).get("blocks", 0) > 0 and parsed.error is None
-    return {"protocol_valid": blocks == 1 and schema3,
-            "first_line": first_line.startswith("<relation_judgment>"),
-            "omitted": blocks == 0,
-            "duplicate_blocks": blocks > 1}
-
-
-async def run_side(side: str, adapter: ProviderAdapter, repeats: int,
-                   scenarios: list[str], warmup: int, price: dict | None,
-                   out_path: Path) -> int:
-    from astrbot.api.provider import ProviderRequest
-    from test_main import FakeContext, FakeEvent
-    from astrbot_plugin_relation_arc.main import RelationArc
-
-    records: list[dict] = []
-    failures = 0
-    temp = tempfile_dir()
-    plugin = RelationArc(FakeContext(temp.name))
-    try:
-        for scenario in scenarios:
-            for repetition in range(repeats):
-                req = ProviderRequest(prompt=scenario, system_prompt="persona",
-                                      contexts=list(PRESET_HISTORY))
-                await plugin.inject(FakeEvent(), req)
-                for _ in range(warmup):
-                    await adapter.complete(req.system_prompt or "", scenario)
-                started = time.perf_counter()
+        if repeats < 1 or warmup < 0 or not scenarios or timeout <= 0:
+            raise ValueError('invalid run counts or timeout')
+        specs = [runtime.scenario(s, name=f's{i:02}') if isinstance(s, str) else copy.deepcopy(s)
+                 for i, s in enumerate(scenarios)]
+        if len({s['id'] for s in specs}) != len(specs):
+            raise ValueError('scenario IDs must be unique')
+        source = runtime.source_info(Path(repo), expected_commit)
+        if not adapter.offline and (source['dirty'] or not expected_commit):
+            raise ValueError('real runs require clean pinned plugin source')
+        plugin_type = runtime.load_plugin(Path(repo))
+        metadata = adapter.metadata()
+        payload.update(source=source, plugin_commit=source['commit'], host_version=runtime.host_version(),
+            adapter=adapter.name, provider=metadata, offline=adapter.offline,
+            scenarios=specs, config=dict(repeats=repeats, warmup=warmup, timeout=timeout), price=price,
+            harness_sha256=runtime.digest({p.name: p.read_text(encoding='utf-8') for p in
+                (Path(__file__), Path(runtime.__file__), Path(__file__).with_name('provider_adapters.py'))}))
+        _write(out_path, payload)
+        for spec in specs:
+            with tempfile.TemporaryDirectory(prefix='relation-ab-') as directory:
+                plugin = plugin_type(runtime.SyntheticContext(directory))
                 try:
-                    text, usage = await adapter.complete(req.system_prompt or "", scenario)
-                    error = None
-                except Exception as exc:
-                    failures += 1
-                    text, usage, error = "", None, f"{type(exc).__name__}: {exc}"
-                latency_ms = (time.perf_counter() - started) * 1000
-                record: dict[str, Any] = {
-                    "side": side, "scenario": scenario, "repetition": repetition,
-                    "adapter": adapter.name, "error": error,
-                    "input_tokens": (usage or {}).get("input_tokens") if usage else None,
-                    "output_tokens": (usage or {}).get("output_tokens") if usage else None,
-                    "cache_hit_tokens": (usage or {}).get("prompt_cache_hit_tokens") if usage else None,
-                    "cache_miss_tokens": (usage or {}).get("prompt_cache_miss_tokens") if usage else None,
-                    "latency_ms": latency_ms, "cost": None,
-                }
-                if error is None:
-                    record.update(_measure(text, scenario))
-                if price and record.get("input_tokens") is not None:
-                    pin = float(price.get("input_per_1k", 0) or 0)
-                    pout = float(price.get("output_per_1k", 0) or 0)
-                    record["cost"] = (record["input_tokens"] * pin + (record["output_tokens"] or 0) * pout) / 1000
-                records.append(record)
-                out_path.write_text(json.dumps(
-                    {"side": side, "ran": True, "adapter": adapter.name,
-                     "plugin_commit": _git_commit(), "records": records,
-                     "config": {"repeats": repeats, "scenarios": len(scenarios),
-                                "warmup": warmup, "preset_history": PRESET_HISTORY}},
-                    ensure_ascii=False, indent=2), encoding="utf-8")
+                    event = runtime.configure(plugin, spec)
+                    for repetition in range(repeats):
+                        req = runtime.new_request(spec)
+                        await plugin.inject(event, req)
+                        request = await runtime.snapshot(req)
+                        for phase, index in [('warmup', i) for i in range(warmup)] + [('measured', 0)]:
+                            record = dict(scenario_id=spec['id'], repetition=repetition, phase=phase,
+                                phase_index=index, request=request, error=None, state='started',
+                                cache_state='unknown' if not warmup or phase == 'warmup' else 'after-explicit-warmup')
+                            payload['records'].append(record)
+                            payload['ran'] = True
+                            _write(out_path, payload)
+                            started = time.perf_counter()
+                            try:
+                                result = await asyncio.wait_for(adapter.complete(copy.deepcopy(req)), timeout)
+                                if adapter.metadata() != metadata:
+                                    raise RuntimeError('provider settings changed during run')
+                                record.update(text=result['text'], **{k: number(result.get('usage', {}).get(k)) for k in
+                                    ('input_tokens', 'output_tokens', 'cache_hit_tokens', 'cache_miss_tokens')})
+                                record['usage_source'] = result.get('usage', {}).get('source', 'missing')
+                                record['response_model'] = result.get('response_model')
+                                allowed = DIMENSIONS if spec.get('visible') else DIMENSIONS - {'romance_interest'}
+                                record.update(_measure(result['text'], spec['prompt'], allowed))
+                                record['cost'] = None if adapter.offline else _cost(record, price)
+                                record['state'] = 'ok'
+                            except Exception as exc:
+                                # Exception strings can contain API keys/headers. Persist only type.
+                                record.update(error=type(exc).__name__, state='failed', text=None, cost=None)
+                            record['latency_ms'] = (time.perf_counter() - started) * 1000
+                            _write(out_path, payload)
+                            if record['error'] is not None:
+                                break
+                finally:
+                    await plugin.terminate()
+        payload['completed'] = True
+    except Exception as exc:
+        payload['reason'] = type(exc).__name__
     finally:
-        await plugin.terminate()
-        temp.cleanup()
-    print(f"run: {len(records)} records, {failures} request failures -> {out_path}")
-    return 0
+        _write(out_path, payload)
+    summary = _summary(payload)
+    payload['summary'] = summary
+    _write(out_path, payload)
+    print(json.dumps(dict(side=side, status=summary['status'], records=len(payload['records']), offline=adapter.offline)))
+    expected = len(scenarios) * repeats * (warmup + 1)
+    return 0 if payload['completed'] and summary['status'] == 'ok' and len(payload['records']) == expected else 2
 
 
-def tempfile_dir():
-    import tempfile
-    return tempfile.TemporaryDirectory(prefix="ab_test_")
-
-
-def _summary(payload: dict) -> dict:
-    records = [r for r in payload.get("records", []) if r.get("error") is None]
-    out: dict[str, Any] = {"adapter": payload.get("adapter"),
-                           "records_total": len(payload.get("records", [])),
-                           "records_ok": len(records)}
-    if not records:
-        out["status"] = "no-valid-samples"
-        return out
-    n = len(records)
-
-    def rate(key: str) -> float:
-        return sum(1 for r in records if r.get(key)) / n
-
-    out.update({"protocol_valid_rate": rate("protocol_valid"),
-                "first_line_rate": rate("first_line"),
-                "omission_rate": rate("omitted"),
-                "duplicate_rate": rate("duplicate_blocks"),
-                "cache_field_reported_fraction":
-                    sum(1 for r in records if r.get("cache_hit_tokens") is not None) / n})
-    lat = [r["latency_ms"] for r in records if r.get("latency_ms") is not None]
-    out["median_latency_ms"] = statistics.median(lat) if lat else None
-    tok_in = [r["input_tokens"] for r in records if r.get("input_tokens") is not None]
-    out["median_input_tokens"] = statistics.median(tok_in) if tok_in else None
-    cost = [r["cost"] for r in records if r.get("cost") is not None]
-    out["total_cost"] = sum(cost) if cost else None
-    out["status"] = "ok"
+def _summary(payload):
+    all_records = payload.get('records', [])
+    measured = [r for r in all_records if r.get('phase', 'measured') == 'measured']
+    records = [r for r in measured if r.get('error') is None and r.get('state', 'ok') == 'ok']
+    out = dict(records_total=len(all_records), measured=len(measured), records_ok=len(records),
+               cache_hit_rate=None, total_cost=None)
+    for label, key in [('protocol_valid_rate', 'protocol_valid'), ('first_line_rate', 'first_line'),
+                       ('omission_rate', 'omitted'), ('duplicate_rate', 'duplicate_blocks')]:
+        out[label] = (sum(r[key] for r in records) / len(records)
+                      if records and all(type(r.get(key)) is bool for r in records) else None)
+    for label, key in [('median_latency_ms', 'latency_ms'), ('median_input_tokens', 'input_tokens')]:
+        values = [number(r.get(key)) for r in records]
+        out[label] = statistics.median(values) if values and None not in values else None
+    paired = [r for r in records if all(number(r.get(k)) is not None for k in ('cache_hit_tokens', 'cache_miss_tokens'))]
+    out['cache_field_reported_fraction'] = len(paired) / len(records) if records else None
+    if records and len(paired) == len(records):
+        denominator = sum(r['cache_hit_tokens'] + r['cache_miss_tokens'] for r in paired)
+        out['cache_hit_rate'] = sum(r['cache_hit_tokens'] for r in paired) / denominator if denominator else None
+    costs = [number(r.get('cost')) for r in all_records]
+    if costs and None not in costs:
+        out['total_cost'] = sum(costs)
+    out['status'] = ('ok' if records and out['protocol_valid_rate'] is not None
+                     and any(r.get('protocol_valid') for r in records)
+                     and all(r.get('error') is None and r.get('state', 'ok') == 'ok' for r in all_records)
+                     else 'no-valid-samples' if not records else 'incomplete-or-invalid')
     return out
 
 
-def compare(baseline_path: Path, candidate_path: Path) -> int:
-    base = json.loads(baseline_path.read_text(encoding="utf-8"))
-    cand = json.loads(candidate_path.read_text(encoding="utf-8"))
+def compare(baseline_path, candidate_path):
+    base, cand = [json.loads(Path(p).read_text(encoding='utf-8')) for p in (baseline_path, candidate_path)]
     problems = []
-    for name, payload in (("baseline", base), ("candidate", cand)):
-        if not payload.get("ran"):
-            problems.append(f"{name} side was never run ({payload.get('reason', 'ran:false')})")
-    if problems:
-        print("; ".join(problems), "— refusing to compare.", file=sys.stderr)
-        return 2
-    sb, sc = _summary(base), _summary(cand)
-    for name, s in (("baseline", sb), ("candidate", sc)):
-        if s["status"] != "ok":
-            print(f"{name} side has {s['status']} — comparison result: UNKNOWN.",
-                  file=sys.stderr)
-    report = {"baseline": sb, "candidate": sc,
-              "notes": "cache fields absent from the provider payload are reported "
-                       "as cache_field_reported_fraction, never as 0%; cost only "
-                       "with a supplied price source; UNKNOWN when either side "
-                       "lacks valid samples."}
+    for side, p in [('baseline', base), ('candidate', cand)]:
+        if p.get('format_version') != 2 or not p.get('ran') or not p.get('completed') or p.get('side') != side:
+            problems.append(side + ': missing, incomplete or wrong-side run')
+        if _summary(p)['status'] != 'ok':
+            problems.append(side + ': failed requests or no valid samples')
+        config = p.get('config', {})
+        expected = [(s['id'], r, phase, i) for s in p.get('scenarios', [])
+                    for r in range(config.get('repeats', 0))
+                    for phase, i in [('warmup', i) for i in range(config.get('warmup', 0))] + [('measured', 0)]]
+        actual = [(r.get('scenario_id'), r.get('repetition'), r.get('phase'), r.get('phase_index'))
+                  for r in p.get('records', [])]
+        if not expected or expected != actual:
+            problems.append(side + ': planned request coverage is incomplete')
+    for key in ('scenarios', 'provider', 'host_version', 'config', 'price', 'harness_sha256'):
+        if key not in base or base.get(key) != cand.get(key):
+            problems.append('incomparable ' + key)
+    if base.get('source', {}).get('source_sha256') == cand.get('source', {}).get('source_sha256'):
+        problems.append('both sides loaded the same source')
+    def keys(p):
+        return [(r.get('scenario_id'), r.get('repetition'), r.get('phase'), r.get('phase_index')) for r in p.get('records', [])]
+    if keys(base) != keys(cand) or len(keys(base)) != len(set(keys(base))):
+        problems.append('unpaired or duplicate requests')
+    if any(b.get('response_model') != c.get('response_model')
+           for b, c in zip(base.get('records', []), cand.get('records', []))):
+        problems.append('provider returned different model identifiers')
+    report = dict(status='UNKNOWN' if problems else 'offline-chain-only' if base.get('offline') else 'measured',
+                  problems=problems, baseline=_summary(base), candidate=_summary(cand),
+                  note='No cold-cache assumption. Costs require complete usage and sourced pricing; offline is not model evidence.')
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    both_ok = sb["status"] == "ok" and sc["status"] == "ok"
-    if not both_ok:
-        print("comparison result: UNKNOWN (a side lacks valid samples); exit 2.",
-              file=sys.stderr)
-    return 0 if both_ok else 2
+    return 2 if problems else 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    run_p = sub.add_parser("run", help="run one side")
-    run_p.add_argument("--side", choices=["baseline", "candidate"], required=True)
-    run_p.add_argument("--out", required=True)
-    run_p.add_argument("--adapter", choices=["auto", "fake"], default="auto",
-                       help="auto=host provider when available; fake=offline dry-run")
-    run_p.add_argument("--repeats", type=int, default=3)
-    run_p.add_argument("--scenarios", type=int, default=len(DEFAULT_SCENARIOS))
-    run_p.add_argument("--warmup", type=int, default=2)
-    run_p.add_argument("--price-json", default=None,
-                       help='optional JSON like {"input_per_1k":0.001,"output_per_1k":0.002}')
-    cmp_p = sub.add_parser("compare", help="summarize two run files")
-    cmp_p.add_argument("baseline")
-    cmp_p.add_argument("candidate")
-    args = parser.parse_args()
-
-    if args.cmd == "compare":
-        return compare(Path(args.baseline), Path(args.candidate))
-
-    adapter: ProviderAdapter | None
-    if args.adapter == "fake":
-        adapter = FakeAdapter()
-    else:
-        adapter = _try_host_adapter()
-        if adapter is None:
-            Path(args.out).write_text(json.dumps(
-                {"side": args.side, "ran": False,
-                 "reason": "host provider layer unavailable; use --adapter fake "
-                           "for an offline chain check or run inside the "
-                           "authorized isolated environment"},
-                ensure_ascii=False, indent=2), encoding="utf-8")
-            print("NOT RUN: no host provider. See the written reason file.",
-                  file=sys.stderr)
-            return 2
-    price = None
-    if args.price_json:
-        price = json.loads(Path(args.price_json).read_text(encoding="utf-8"))
-    scenarios = DEFAULT_SCENARIOS[:max(1, args.scenarios)]
-    return asyncio.run(run_side(args.side, adapter, max(1, args.repeats),
-                                scenarios, max(0, args.warmup), price,
-                                Path(args.out)))
+async def _factory(reference):
+    path, name = reference.rsplit(':', 1)
+    spec = importlib.util.spec_from_file_location('relation_authorized_provider', Path(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = getattr(module, name)()
+    return await result if inspect.isawaitable(result) else result
 
 
-if __name__ == "__main__":
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='command', required=True)
+    run = sub.add_parser('run')
+    run.add_argument('--side', choices=['baseline', 'candidate'], required=True)
+    run.add_argument('--repo', type=Path, required=True)
+    run.add_argument('--expected-commit')
+    run.add_argument('--out', type=Path, required=True)
+    run.add_argument('--adapter', choices=['fake', 'factory'], default='factory')
+    run.add_argument('--provider-factory', help='authorized local file.py:function returning HostAdapter')
+    run.add_argument('--allow-paid', action='store_true')
+    run.add_argument('--max-calls', type=int)
+    run.add_argument('--repeats', type=int, default=3)
+    run.add_argument('--scenarios', type=int, default=20)
+    run.add_argument('--warmup', type=int, default=0)
+    run.add_argument('--timeout', type=float, default=120)
+    run.add_argument('--price-json', type=Path)
+    run.add_argument('--plan-only', action='store_true')
+    comp = sub.add_parser('compare')
+    comp.add_argument('baseline', type=Path)
+    comp.add_argument('candidate', type=Path)
+    args = p.parse_args()
+    if args.command == 'compare':
+        return compare(args.baseline, args.candidate)
+    async def execute():
+        if not (1 <= args.scenarios <= 20) or args.repeats < 1 or args.warmup < 0 or args.timeout <= 0:
+            raise ValueError('invalid scenario/repeat/warmup/timeout')
+        source = runtime.source_info(args.repo, args.expected_commit)
+        count = args.scenarios * args.repeats * (args.warmup + 1)
+        if args.plan_only:
+            _write(args.out, dict(side=args.side, ran=False, planned_calls=count, source=source, reason='plan-only; no adapter loaded'))
+            return 0
+        if args.adapter == 'fake':
+            adapter = FakeAdapter()
+        else:
+            if not args.allow_paid or not args.provider_factory or not args.expected_commit or source['dirty']:
+                raise ValueError('authorization, factory and clean pinned source required')
+            if args.max_calls is None or count > args.max_calls:
+                raise ValueError('explicit call budget exceeded')
+            adapter = await _factory(args.provider_factory)
+            if not isinstance(adapter, HostAdapter):
+                raise ValueError('factory must return HostAdapter')
+        price = json.loads(args.price_json.read_text(encoding='utf-8')) if args.price_json else None
+        try:
+            return await run_side(args.side, adapter, args.repeats, runtime.default_scenarios()[:args.scenarios],
+                                  args.warmup, price, args.out, repo=args.repo,
+                                  expected_commit=args.expected_commit, timeout=args.timeout)
+        finally:
+            if hasattr(adapter, 'close'):
+                await adapter.close()
+    try:
+        return asyncio.run(execute())
+    except Exception as exc:
+        _write(args.out, dict(side=args.side, ran=False, completed=False, reason=type(exc).__name__))
+        print('NOT RUN: invalid inputs/source pin or missing authorized provider. See docs/MODEL_AB.md.', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
     raise SystemExit(main())

@@ -1,0 +1,100 @@
+{
+  "source": {
+    "commit": "56e5985e657ff4e830de59df45eb0c2b2270035e",
+    "source_sha256": "355db222b55886fc8f6c730c12fb3c3b63d2b339a4bba82eacd2c664619cca96",
+    "files": {
+      "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "commands.py": "d27223d6a24cab90d5d5d01dad1f69084d3d650baa0ee34490ffe65c5eea070e",
+      "config_manager.py": "f994988ae0a5a5ceffc628d9cf26004f443b094101b21d472fc7cb5499c7f09a",
+      "main.py": "971561b4217c565d12a8ed951920b0306fc2e0feb866f46d5fbdb7fcc6a74aa9",
+      "pages_api.py": "b421d66c155c5cb28063f9d374985b8e130d9c771ce66831cc9a295bf6de85c3",
+      "prompts.py": "a8e09db8abf09d5f98d42551de568f2a7754f030816c0c62d9af85afc3a4ff5e",
+      "relation_engine.py": "c6bdc49fae6a867b90a0d19709b38a6aec05889f5f3b7a77cd40ada68abeecc6",
+      "relation_protocol.py": "049456311f52bd850379673ff3e7fd00daaed899ca25e22bd181c817c5db6b8a",
+      "relation_store.py": "f7bbe9bc176a6d7897e6f6b7fc7bd19dea5327837a8c0888a46d1722ff6313ef",
+      "relationship_types.py": "c70115ea9e41b094b6b0886abadb7a396bbc9fe0c698051e050d78fd51e29605",
+      "metadata.yaml": "8c1101ef7c5a354e219e2d51eb7cb69848b5a8ab2a21787311a22a1d9b42149f"
+    },
+    "dirty": false
+  },
+  "host_version": "4.26.0",
+  "reference_sha256": "39938b763df8c69cd772d1951f743d3559628839abf2a91433b78586cda70a77",
+  "reference_scope": "extracted prompt templates and favour regex only",
+  "live_hooks_and_reference_database": "NOT TESTED",
+  "feedback_plugin_identity": "UNKNOWN",
+  "records": [
+    {
+      "persona": "ordinary",
+      "mode": "relation_only",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": false,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "189d09db65c546f6ba7d2c12b1bb847c46d6ab27832b53d2841d00d832597a44"
+    },
+    {
+      "persona": "ordinary",
+      "mode": "favour_only",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": false,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "51a8221d0c512ea7d85086bb6b7e6ab730fae42c89a4dc2f9d2490c1ed60fa35"
+    },
+    {
+      "persona": "ordinary",
+      "mode": "favour_before_relation",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": true,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "2b45002e05ed0f425b0cd407aba31c85edf40e079d8fdb7d5b9bd2e8e32b5757"
+    },
+    {
+      "persona": "ordinary",
+      "mode": "favour_after_relation",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": true,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "11c996b3abba1b70713c74af7965c569f4accc2a4283458c272b0d8a7da22599"
+    },
+    {
+      "persona": "rules",
+      "mode": "relation_only",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": false,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "f02be9f67dce20907bf44dee7e2f50f9329cf4bfec9a5c36a17b7a7fe8b81d77"
+    },
+    {
+      "persona": "rules",
+      "mode": "favour_only",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": false,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "d5d650fd420c18f5adf2449e754c84bac861e021000cf547215ef889ff229046"
+    },
+    {
+      "persona": "rules",
+      "mode": "favour_before_relation",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": true,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "13ab2f355c5654d76122384245844c0bba00620688c90a889282cc787198fe6d"
+    },
+    {
+      "persona": "rules",
+      "mode": "favour_after_relation",
+      "synthetic_label_cleaning": true,
+      "both_cleaning_orders_tested": true,
+      "persona_verbatim_preserved": true,
+      "model_behavior": "NOT TESTED",
+      "request_sha256": "3f9d5091f952c88dca6193226c17e08bf960b6ec9846849a6861f90069bf4ce5"
+    }
+  ],
+  "note": "Full extracted upstream prompt snapshots retained in local evidence; rerun compatibility_probe with the exact reviewed source to reproduce. No upstream source is executed."
+}

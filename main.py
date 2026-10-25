@@ -3,6 +3,8 @@ import json
 import time
 import re
 import asyncio
+from dataclasses import dataclass, field
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Optional
 
@@ -47,6 +49,13 @@ def _read_plugin_version() -> str:
     return "0.1.0"
 
 PLUGIN_VERSION = _read_plugin_version()
+
+
+@dataclass(frozen=True)
+class _PromptInjection:
+    before: str
+    added: str
+    token: str = field(default_factory=lambda: uuid4().hex)
 
 @register(PLUGIN_NAME, "Ewnscat", "独立多维关系、风格投影与可审计关系账本", PLUGIN_VERSION)
 class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
@@ -309,46 +318,53 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
 
     # MIS-158/U01: ownership is tracked per request, never by literal tag
     # text. The private attribute below records exactly what THIS plugin
-    # appended to the request: the precise system-prompt addition (separator
-    # + fixed block, byte-for-byte) and the exact part objects it created.
-    # Cleanup removes only those recorded additions; persona examples with
-    # the same markers, other plugins' parts and later appends are untouched.
+    # appended, including its original anchor and non-serialized part tokens.
+    # The record survives ordinary request copies and dataclass reconstruction.
     _OWN_INJECTION_ATTR = "_relation_arc_own_injection"
 
     @classmethod
-    def _own_injection(cls, req: ProviderRequest) -> dict | None:
+    def _own_injection(cls, req: ProviderRequest) -> _PromptInjection | None:
         record = getattr(req, cls._OWN_INJECTION_ATTR, None)
-        return record if isinstance(record, dict) else None
+        if isinstance(record, _PromptInjection):
+            return record
+        # dataclasses.replace/asdict reconstruction drops request attributes,
+        # but preserves the host's ContentPart objects (or deep copies of them).
+        # Private metadata is not included in model_dump/provider/history JSON.
+        for part in req.extra_user_content_parts or []:
+            record = getattr(part, cls._OWN_INJECTION_ATTR, None)
+            if isinstance(record, _PromptInjection):
+                return record
+        return None
 
     @classmethod
-    def _rollback_own_injection(cls, req: ProviderRequest) -> None:
-        """Remove exactly what this plugin previously added to THIS request.
+    def _rollback_own_injection(cls, req: ProviderRequest) -> bool:
+        """Locate the recorded insertion, never an arbitrary equal block.
 
-        The system addition is removed as one exact substring (prefer the
-        suffix; fall back to a single splice anywhere in the string, which
-        only ever matches the bytes we appended and keeps text other
-        plugins appended before/after it). The temporary parts are removed
-        by object identity — no text matching at all. With no record (this
-        request was never injected by us) the request is left untouched."""
+        The complete pre-injection prefix anchors our insertion even when a
+        literal copy of the rules occurs before/after it. External prepends
+        and appends are retained. If a rewriter destroys/duplicates the anchor
+        while leaving a possible block, ownership is ambiguous: leave it all
+        untouched and do not compound it by injecting another copy.
+        """
         record = cls._own_injection(req)
         if record is None:
-            return
-        added_system = record.get("system_added")
-        if added_system:
-            current = req.system_prompt or ""
-            if current.endswith(added_system):
-                req.system_prompt = current[:-len(added_system)]
-            elif added_system in current:
-                # Someone appended after our block: splice out only our
-                # exact bytes and keep their suffix intact.
-                req.system_prompt = current.replace(added_system, "", 1)
-        own_parts = record.get("parts") or []
-        if own_parts:
-            own_ids = {id(part) for part in own_parts}
-            req.extra_user_content_parts = [
-                part for part in (req.extra_user_content_parts or [])
-                if id(part) not in own_ids]
+            return True
+        current = req.system_prompt or ""
+        anchor = record.before + record.added
+        start = current.find(anchor)
+        if start >= 0 and current.find(anchor, start + 1) < 0:
+            offset = start + len(record.before)
+            req.system_prompt = current[:offset] + current[offset + len(record.added):]
+        elif record.added in current:
+            logger.warning("[关系弧线] prompt ownership ambiguous; request left unchanged")
+            return False
+        # Complete external replacement: do not restore a stale persona.
+        req.extra_user_content_parts = [
+            part for part in (req.extra_user_content_parts or [])
+            if not (isinstance(getattr(part, cls._OWN_INJECTION_ATTR, None), _PromptInjection)
+                    and getattr(part, cls._OWN_INJECTION_ATTR).token == record.token)]
         setattr(req, cls._OWN_INJECTION_ATTR, None)
+        return True
 
     @filter.on_llm_request()
     async def inject(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -363,7 +379,8 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # reference before anything new is added; a disabled gate leaves the
         # request exactly as it was (a request we never injected is not
         # touched at all).
-        self._rollback_own_injection(req)
+        if not self._rollback_own_injection(req):
+            return
         if not self._enabled(event) or not self.config.get("llm_judgment_enabled", True): return
         account = self.store.account(identity, scope_kind, scope_id)
         values, state = account["values"], self._effective_state(identity,scope_kind,scope_id,account["state"])
@@ -400,8 +417,10 @@ class RelationArc(PagesApiMixin, CommandHelpersMixin, Star):
         # U01: record the exact additions owned by this plugin on THIS
         # request so a later inject (repeat or disable) rolls back precisely
         # these bytes and objects — never anything matched by tag text.
-        setattr(req, self._OWN_INJECTION_ATTR,
-                {"system_added": system_added, "parts": [dynamic_part, reminder_part]})
+        record = _PromptInjection(system_before, system_added)
+        setattr(req, self._OWN_INJECTION_ATTR, record)
+        for part in (dynamic_part, reminder_part):
+            setattr(part, self._OWN_INJECTION_ATTR, record)
 
     def _read_and_strip_judgment(self, response: LLMResponse, user_text: str):
         """Read the final provider payload without assuming completion_text is used.
